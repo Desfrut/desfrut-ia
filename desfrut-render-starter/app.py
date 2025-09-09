@@ -1,4 +1,4 @@
-# app.py — Desfrut IA (Agente de Atendimento + Q&A + RAG), sem "Fontes" no /ask
+# app.py — Desfrut IA (estável): Q&A (se houver), Agente básico e RAG. Sem "Fontes" no /ask.
 
 from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib
@@ -8,24 +8,23 @@ import chromadb
 from chromadb.config import Settings
 from openai import OpenAI
 
-# ========== ENV ==========
+# ========= ENV =========
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEN_MODEL      = os.getenv("GEN_MODEL", "gpt-4o-mini")
-CHROMA_DIR     = os.getenv("CHROMA_DIR", "/data/chroma")
+CHROMA_DIR     = os.getenv("CHROMA_DIR", "/data/chroma")  # <- importante no Render
 COL_APOSTILA   = os.getenv("COL_APOSTILA", "desfrut_apostila")
 COL_PRODUTOS   = os.getenv("COL_PRODUTOS", "desfrut_produtos")
 TOP_K          = int(os.getenv("TOP_K", "5"))
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
-# Estado simples por cliente (para o agente)
 STATE_DB       = os.getenv("STATE_DB", "/data/state.json")
 PRODUTOS_CSV   = os.getenv("PRODUTOS_CSV", "produtos.csv")
 
-# ========== APP ==========
+# ========= APP =========
 app = Flask(__name__)
 oai  = OpenAI(api_key=OPENAI_API_KEY)
 
-# ======= Util: horário Manaus para saudação (opcional) =======
+# ========= Saudação/humanização =========
 try:
     import pytz
     TZ = pytz.timezone("America/Manaus")
@@ -42,7 +41,6 @@ def _saudacao_periodo():
     except Exception:
         return "Oi! "
 
-# ======= Humanização da resposta =======
 def humanize(texto: str, nome: str | None = None) -> str:
     texto = (texto or "").strip()
     if not texto:
@@ -50,18 +48,16 @@ def humanize(texto: str, nome: str | None = None) -> str:
     prefix = _saudacao_periodo()
     if nome:
         prefix = prefix.replace("!", f", {nome.split(' ')[0]}! ")
-    # Evita duplicar se a resposta já começa com oi/boa...
     primeiros = texto[:20].lower()
     if any(p in primeiros for p in ["oi", "olá", "ola", "boa "]):
         prefix = ""
     return (prefix + texto).strip()
 
-# ======= Embedding util =======
+# ========= Chroma/Embeddings =========
 def embed_one(text: str):
     emb = oai.embeddings.create(model=EMBED_MODEL, input=text)
     return emb.data[0].embedding
 
-# ======= Chroma util =======
 def get_collection(name: str):
     client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
     return client.get_or_create_collection(name)
@@ -74,38 +70,35 @@ def retrieve(col_name: str, question: str, top_k: int = TOP_K):
     metas = res.get("metadatas", [[]])[0]
     return docs, metas
 
-# ======= RAG (apostila + produtos) para fallback =======
+# ========= RAG (apostila + produtos) =========
 def build_context(question: str):
-    context_parts = []
+    parts = []
     try:
-        docs_a, metas_a = retrieve(COL_APOSTILA, question)
-        if docs_a:
-            context_parts.append("=== APOSTILA ===")
-            for d, _m in zip(docs_a, metas_a):
-                context_parts.append(d)
+        d1, m1 = retrieve(COL_APOSTILA, question)
+        if d1:
+            parts.append("=== APOSTILA ===")
+            for d, _ in zip(d1, m1):
+                parts.append(d)
     except Exception as e:
-        context_parts.append(f"(Apostila indisponível: {e})")
-
+        parts.append(f"(Apostila indisponível: {e})")
     try:
-        docs_p, metas_p = retrieve(COL_PRODUTOS, question)
-        if docs_p:
-            context_parts.append("\n=== PRODUTOS ===")
-            for d, _m in zip(docs_p, metas_p):
-                context_parts.append(d)
+        d2, m2 = retrieve(COL_PRODUTOS, question)
+        if d2:
+            parts.append("\n=== PRODUTOS ===")
+            for d, _ in zip(d2, m2):
+                parts.append(d)
     except Exception as e:
-        context_parts.append(f"(Produtos indisponíveis: {e})")
-
-    return "\n\n".join(context_parts)
+        parts.append(f"(Produtos indisponíveis: {e})")
+    return "\n\n".join(parts)
 
 def answer_rag(question: str) -> str:
-    context = build_context(question)
-    if not context.strip():
+    ctx = build_context(question)
+    if not ctx.strip():
         user_content = (f"Pergunta: {question}\n\n"
                         "Contexto (vazio). Diga que não encontrou na base e ofereça uma orientação geral breve.")
     else:
         user_content = (f"Pergunta: {question}\n\n"
-                        f"Contexto (use com prioridade):\n{context}")
-
+                        f"Contexto (use com prioridade):\n{ctx}")
     resp = oai.chat.completions.create(
         model=GEN_MODEL,
         messages=[
@@ -120,7 +113,7 @@ def answer_rag(question: str) -> str:
     )
     return resp.choices[0].message.content
 
-# ======= Q&A base (coleção 'qna' treinada via treinar_base_qna.py) =======
+# ========= Q&A base (se a coleção 'qna' existir) =========
 def answer_qna(query: str):
     try:
         col = get_collection("qna")
@@ -129,9 +122,8 @@ def answer_qna(query: str):
         if not r or not r.get("documents") or not r["documents"][0]:
             return None
         doc  = r["documents"][0][0]
-        dist = r["distances"][0][0]  # em geral: menor = mais parecido (cosine distance ~ 1 - sim)
-        if dist <= 0.20:  # ~similaridade >= 0.8
-            # documento salvo como "pergunta\n\nRESPOSTA:\nresposta"
+        dist = r["distances"][0][0]  # menor = mais parecido
+        if dist <= 0.20:
             if "RESPOSTA:" in doc:
                 return doc.split("RESPOSTA:\n", 1)[-1].strip()
             return doc.strip()
@@ -139,7 +131,7 @@ def answer_qna(query: str):
     except Exception:
         return None
 
-# ======= Memória simples por cliente =======
+# ========= Memória + Produtos CSV (Agente) =========
 def _load_state():
     try:
         with open(STATE_DB, 'r', encoding='utf-8') as f:
@@ -154,7 +146,6 @@ def _save_state(d):
     except Exception:
         pass
 
-# ======= Produtos CSV (para buscas rápidas do agente) =======
 def _carregar_produtos():
     itens = []
     try:
@@ -167,7 +158,6 @@ def _carregar_produtos():
     return itens
 
 PROD_CACHE = None
-
 def buscar_produto(termo: str, n=3):
     global PROD_CACHE
     if PROD_CACHE is None:
@@ -175,19 +165,17 @@ def buscar_produto(termo: str, n=3):
     if not PROD_CACHE:
         return []
     termo = (termo or "").strip()
-    # 1) Busca por SKU
+    # SKU
     for p in PROD_CACHE:
         if termo.lower() in str(p.get('sku','')).lower():
             return [p]
-    # 2) Fuzzy por nome/titulo
+    # Fuzzy nome
     nomes = [p.get('nome') or p.get('título') or p.get('titulo') or '' for p in PROD_CACHE]
     match = difflib.get_close_matches(termo, nomes, n=n, cutoff=0.5)
     res = [p for p in PROD_CACHE if (p.get('nome') or p.get('título') or p.get('titulo') or '') in match]
     return res[:n]
 
-# ======= Ferramentas do agente =======
 CEP_RE = re.compile(r"\b\d{5}-?\d{3}\b")
-
 def tool_cotar_frete(cep: str):
     cep = re.sub(r"\D", "", cep)
     if cep.startswith("690"):
@@ -217,17 +205,13 @@ def tool_criar_pedido(state: dict):
     return (f"Pedido rascunho criado: {pedido_id}. Agora me confirme o método de pagamento (Pix ou cartão em até 6x) "
             f"e o endereço/retirada para eu finalizar.")
 
-# ======= Roteador do agente =======
 def agente_responder(user_text: str, customer_id: str | None, customer_name: str | None):
     txt = (user_text or '').strip()
     if not txt:
         return None
-
-    # estado
     db = _load_state()
     st = db.get(customer_id or 'anon', {"carrinho": []})
 
-    # a) CEP/frete
     m = CEP_RE.search(txt)
     if m:
         cep = m.group(0)
@@ -236,26 +220,18 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         _save_state(db)
         return tool_cotar_frete(cep)
 
-    # b) produto/preço/sku
     gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "sku", "tamanho", "cor"]
     if any(g in txt.lower() for g in gatilhos):
         termo = re.sub(r"\b(tem|de|o|a|um|uma|preço|valor|do|da|no|na|sku|tamanho|cor|disponível|estoque)\b", "", txt, flags=re.I)
         termo = termo.strip() or txt
         return tool_ver_produto(termo)
 
-    # c) finalizar compra
     if re.search(r"\b(finalizar|fechar|comprar|fechar pedido|checkout)\b", txt, flags=re.I):
         return tool_criar_pedido(st)
 
     return None
 
-# ======= Mini endpoint de teste (opcional) =======
-@app.get('/produto')
-def http_produto():
-    q = request.args.get('q', '')
-    return jsonify(buscar_produto(q, n=5))
-
-# ======= Página web simples (sem exibir "Fontes") =======
+# ========= Páginas =========
 HTML = """
 <!doctype html>
 <html>
@@ -267,7 +243,6 @@ HTML = """
     h1 { margin-bottom: 8px; }
     .box { background: #f8f8f8; padding: 16px; border-radius: 12px; }
     .msg { margin: 12px 0; }
-    input, button, textarea { font-size: 16px; }
     #q { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
     #send { padding: 10px 16px; border-radius: 8px; border: 0; background: #111; color: #fff; cursor: pointer; margin-top: 8px; }
     #send:disabled { opacity: .5; }
@@ -283,7 +258,6 @@ HTML = """
     <button id="send">Perguntar</button>
   </div>
   <div id="out" class="msg"></div>
-
 <script>
 async function ask() {
   const btn = document.getElementById('send');
@@ -316,7 +290,11 @@ document.getElementById('q').addEventListener('keydown', e => {
 def home():
     return render_template_string(HTML)
 
-# ======= /ask — Q&A -> Agente -> RAG (sem "fontes" no retorno) =======
+@app.get("/healthz")
+def healthz():
+    return jsonify(ok=True)
+
+# ========= /ask =========
 @app.post("/ask")
 def ask():
     data = request.get_json(force=True) or {}
@@ -326,23 +304,23 @@ def ask():
     if not user_q:
         return jsonify({"error": "Pergunta vazia."}), 400
 
-    # 1) Q&A fixo
+    # 1) Q&A (se coleção existir)
     qna = answer_qna(user_q)
     if qna:
         return jsonify({"answer": humanize(qna, cust_name)})
 
-    # 2) Agente (ferramentas)
+    # 2) Agente
     agent_ans = agente_responder(user_q, cust_id, cust_name)
     if agent_ans:
         return jsonify({"answer": humanize(agent_ans, cust_name)})
 
-    # 3) Fallback: RAG apostila+produtos
+    # 3) RAG fallback
     try:
         ans = answer_rag(user_q)
         return jsonify({"answer": humanize(ans, cust_name)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ======= Main =======
+# ========= MAIN =========
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
