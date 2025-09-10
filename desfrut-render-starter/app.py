@@ -1,4 +1,4 @@
-# app.py — Desfrut IA (estável): Q&A (se houver), Agente básico e RAG. Sem "Fontes" no /ask.
+# app.py — Desfrut IA (Estável): Agente + Q&A + RAG + /admin/train (sem "Fontes")
 
 from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib
@@ -6,25 +6,26 @@ from datetime import datetime
 
 import chromadb
 from chromadb.config import Settings
+from chromadb.utils import embedding_functions
 from openai import OpenAI
 
 # ========= ENV =========
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEN_MODEL      = os.getenv("GEN_MODEL", "gpt-4o-mini")
-CHROMA_DIR     = os.getenv("CHROMA_DIR", "/data/chroma")  # <- importante no Render
+CHROMA_DIR     = os.getenv("CHROMA_DIR", "/data/chroma")
 COL_APOSTILA   = os.getenv("COL_APOSTILA", "desfrut_apostila")
 COL_PRODUTOS   = os.getenv("COL_PRODUTOS", "desfrut_produtos")
 TOP_K          = int(os.getenv("TOP_K", "5"))
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-
 STATE_DB       = os.getenv("STATE_DB", "/data/state.json")
 PRODUTOS_CSV   = os.getenv("PRODUTOS_CSV", "produtos.csv")
+ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "")  # defina em Environment
 
 # ========= APP =========
 app = Flask(__name__)
 oai  = OpenAI(api_key=OPENAI_API_KEY)
 
-# ========= Saudação/humanização =========
+# ========= Saudação/humanização (Manaus) =========
 try:
     import pytz
     TZ = pytz.timezone("America/Manaus")
@@ -53,7 +54,7 @@ def humanize(texto: str, nome: str | None = None) -> str:
         prefix = ""
     return (prefix + texto).strip()
 
-# ========= Chroma/Embeddings =========
+# ========= Embeddings/Chroma =========
 def embed_one(text: str):
     emb = oai.embeddings.create(model=EMBED_MODEL, input=text)
     return emb.data[0].embedding
@@ -113,7 +114,7 @@ def answer_rag(question: str) -> str:
     )
     return resp.choices[0].message.content
 
-# ========= Q&A base (se a coleção 'qna' existir) =========
+# ========= Q&A base (coleção 'qna') =========
 def answer_qna(query: str):
     try:
         col = get_collection("qna")
@@ -231,6 +232,46 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
 
     return None
 
+# ========= Admin: treino de Q&A via HTTP (sem shell) =========
+def train_qna(csv_path: str, reset: bool = False) -> int:
+    client = chromadb.PersistentClient(path=CHROMA_DIR)
+    if reset:
+        try:
+            client.delete_collection("qna")
+        except Exception:
+            pass
+    ef = embedding_functions.OpenAIEmbeddingFunction(api_key=OPENAI_API_KEY, model_name=EMBED_MODEL)
+    col = client.get_or_create_collection("qna", embedding_function=ef)
+    docs, metas, ids = [], [], []
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            q = (row.get("pergunta") or "").strip()
+            a = (row.get("resposta") or "").strip()
+            t = (row.get("tags") or "").strip()
+            if not q or not a:
+                continue
+            docs.append(q + "\n\nRESPOSTA:\n" + a)
+            metas.append({"tags": t})
+            ids.append(os.urandom(8).hex())
+    if not docs:
+        return 0
+    col.add(documents=docs, metadatas=metas, ids=ids)
+    return len(docs)
+
+@app.get('/admin/train')
+def admin_train():
+    token = request.args.get('token', '')
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        return jsonify(ok=False, error='forbidden'), 403
+    path = request.args.get('path', 'base_qna.csv')
+    reset = request.args.get('reset', '0').lower() in ('1','true','yes','on')
+    try:
+        n = train_qna(path, reset=reset)
+        return jsonify(ok=True, inserted=n, reset=reset, path=path)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e), path=path), 500
+
 # ========= Páginas =========
 HTML = """
 <!doctype html>
@@ -304,12 +345,12 @@ def ask():
     if not user_q:
         return jsonify({"error": "Pergunta vazia."}), 400
 
-    # 1) Q&A (se coleção existir)
+    # 1) Q&A
     qna = answer_qna(user_q)
     if qna:
         return jsonify({"answer": humanize(qna, cust_name)})
 
-    # 2) Agente
+    # 2) Agente (ferramentas)
     agent_ans = agente_responder(user_q, cust_id, cust_name)
     if agent_ans:
         return jsonify({"answer": humanize(agent_ans, cust_name)})
