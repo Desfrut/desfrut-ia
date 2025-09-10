@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: desfrut-ia
+    env: python
+    plan: starter        
+    region: brasil      
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 2
