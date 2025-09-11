@@ -6,7 +6,6 @@ from datetime import datetime
 
 import chromadb
 from chromadb.config import Settings
-from chromadb.utils import embedding_functions
 from openai import OpenAI
 
 # ========= ENV =========
@@ -240,9 +239,10 @@ def train_qna(csv_path: str, reset: bool = False) -> int:
             client.delete_collection("qna")
         except Exception:
             pass
-    ef = embedding_functions.OpenAIEmbeddingFunction(api_key=OPENAI_API_KEY, model_name=EMBED_MODEL)
-    col = client.get_or_create_collection("qna", embedding_function=ef)
-    docs, metas, ids = [], [], []
+    # Sem embedding_function aqui
+    col = client.get_or_create_collection("qna")
+
+    docs, metas, ids, vecs = [], [], [], []
     with open(csv_path, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -251,12 +251,17 @@ def train_qna(csv_path: str, reset: bool = False) -> int:
             t = (row.get("tags") or "").strip()
             if not q or not a:
                 continue
-            docs.append(q + "\n\nRESPOSTA:\n" + a)
+            doc = q + "\n\nRESPOSTA:\n" + a
+            docs.append(doc)
             metas.append({"tags": t})
             ids.append(os.urandom(8).hex())
+            # embed do lado de cá: usa sua função embed_one (OpenAI embeddings)
+            vecs.append(embed_one(q))
+
     if not docs:
         return 0
-    col.add(documents=docs, metadatas=metas, ids=ids)
+
+    col.add(documents=docs, metadatas=metas, ids=ids, embeddings=vecs)
     return len(docs)
 
 @app.get('/admin/train')
