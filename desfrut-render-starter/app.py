@@ -1,5 +1,5 @@
-# app.py — Desfrut IA (resiliente): NUNCA 500 em /ask
-# Agente + Q&A + RAG + /admin/train. Respostas SEM “Fontes”.
+# app.py — Desfrut IA (resiliente + agente melhorado)
+# Agente + Q&A + RAG + /admin/train + /admin/qna_count. Sem “Fontes”. Nunca 500 no /ask.
 
 from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib
@@ -9,21 +9,21 @@ from datetime import datetime
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEN_MODEL      = os.getenv("GEN_MODEL", "gpt-4o-mini")
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-CHROMA_DIR     = os.getenv("CHROMA_DIR", "/tmp/chroma")
-STATE_DB       = os.getenv("STATE_DB", "/tmp/state.json")
-PRODUTOS_CSV   = os.getenv("PRODUTOS_CSV", "base_produtos.csv")  # ajuste se quiser
+CHROMA_DIR     = os.getenv("CHROMA_DIR", "/tmp/chroma")      # mude p/ /data/chroma se tiver Disk
+STATE_DB       = os.getenv("STATE_DB", "/tmp/state.json")    # mude p/ /data/state.json se tiver Disk
+PRODUTOS_CSV   = os.getenv("PRODUTOS_CSV", "base_produtos.csv")
 ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "")
 
 app = Flask(__name__)
 
-# ===== OpenAI (carrega se tiver chave) =====
+# ===== OpenAI (usa se houver chave) =====
 oai = None
 if OPENAI_API_KEY:
     try:
         from openai import OpenAI
         oai = OpenAI(api_key=OPENAI_API_KEY)
     except Exception:
-        oai = None  # segue sem OpenAI
+        oai = None
 
 # ===== Timezone p/ saudação =====
 try:
@@ -44,7 +44,7 @@ def _saudacao():
 def humanize(texto: str, nome: str | None = None) -> str:
     texto = (texto or "").strip()
     if not texto:
-        return "Posso ajudar em mais alguma coisa?"
+        return "Posso te ajudar com mais alguma coisa?"
     pref = _saudacao()
     if nome:
         pref = pref.replace("!", f", {nome.split(' ')[0]}! ")
@@ -52,7 +52,16 @@ def humanize(texto: str, nome: str | None = None) -> str:
         pref = ""
     return (pref + texto).strip()
 
-# ===== Produtos CSV / busca =====
+# ========= Utils: OpenAI embeddings com fallback silencioso =========
+def _embed(text: str):
+    if not oai: return None
+    try:
+        e = oai.embeddings.create(model=EMBED_MODEL, input=text)
+        return e.data[0].embedding
+    except Exception:
+        return None
+
+# ========= Produtos CSV =========
 def _carregar_produtos():
     itens = []
     try:
@@ -80,7 +89,7 @@ def buscar_produto(termo: str, n=3):
     res = [p for p in PROD_CACHE if (p.get('nome') or p.get('título') or p.get('titulo') or '') in match]
     return res[:n]
 
-# ===== Memória simples =====
+# ========= Memória simples =========
 def _load_state():
     try:
         with open(STATE_DB, 'r', encoding='utf-8') as f:
@@ -94,14 +103,21 @@ def _save_state(d):
     except Exception:
         pass
 
-# ===== Ferramentas do agente =====
+# ========= Ferramentas do agente =========
 CEP_RE = re.compile(r"\b\d{5}-?\d{3}\b")
+# NOVO: intenção de entrega/frete mesmo sem CEP
+ENTREGA_RE = re.compile(r"\b(entrega|entregam|entregas|frete|envia|enviam|delivery|motoboy|retirada|retira|buscar)\b", re.I)
 
 def tool_cotar_frete(cep: str):
     cep = re.sub(r"\D", "", cep)
     if cep.startswith("690"):
         return "Em Manaus, oferecemos frete imediato grátis em horário comercial. Informe o bairro para estimativa do tempo de entrega."
-    return ("Para o seu CEP, coto frete pelos Correios (PAC/Sedex). Me diga cidade/UF e se prefere PAC (econômico) ou Sedex (rápido).")
+    return ("Para o seu CEP, coto frete pelos Correios (PAC/Sedex). Me diga a cidade/UF e se prefere PAC (econômico) ou Sedex (rápido).")
+
+def tool_politica_entrega_sem_cep():
+    return ("Atendemos Manaus com frete imediato em horário comercial. Para interior do AM e demais regiões do Brasil, "
+            "enviamos por Correios (PAC/Sedex). Se me passar o CEP, eu já te digo o prazo e o valor. "
+            "Se for Manaus, me diga o bairro que estimo o tempo.")
 
 def tool_ver_produto(termo: str):
     itens = buscar_produto(termo, n=3)
@@ -129,6 +145,7 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
     db = _load_state()
     st = db.get(customer_id or "anon", {"carrinho": []})
 
+    # a) CEP explícito => cotação
     m = CEP_RE.search(txt)
     if m:
         cep = m.group(0)
@@ -137,45 +154,46 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         _save_state(db)
         return tool_cotar_frete(cep)
 
+    # b) intenção de entrega/frete sem CEP
+    if ENTREGA_RE.search(txt):
+        return tool_politica_entrega_sem_cep()
+
+    # c) ver produto (preço/estoque/SKU)
     gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "sku", "tamanho", "cor"]
     if any(g in txt.lower() for g in gatilhos):
         termo = re.sub(r"\b(tem|de|o|a|um|uma|preço|valor|do|da|no|na|sku|tamanho|cor|disponível|estoque)\b", "", txt, flags=re.I).strip() or txt
         return tool_ver_produto(termo)
 
+    # d) fechamento de pedido
     if re.search(r"\b(finalizar|fechar|comprar|fechar pedido|checkout)\b", txt, flags=re.I):
         return tool_criar_pedido(st)
 
     return None
 
-# ====== Q&A + RAG (seguros) ======
-# Chroma só é usado se disponível; nunca causa 500.
-def _embed(text: str):
-    if not oai: return None
-    try:
-        e = oai.embeddings.create(model=EMBED_MODEL, input=text)
-        return e.data[0].embedding
-    except Exception:
-        return None
-
+# ========= Q&A base (Chroma) =========
 def answer_qna(q: str):
+    # Se não estiver treinado ou embeddings indisponíveis, retorna None silenciosamente
     try:
         import chromadb
         from chromadb.config import Settings
         client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
         col = client.get_or_create_collection("qna")
         vec = _embed(q)
-        if not vec: return None
+        if not vec:
+            return None
         r = col.query(query_embeddings=[vec], n_results=1, include=["documents","distances"])
         if not r or not r.get("documents") or not r["documents"][0]:
             return None
         doc  = r["documents"][0][0]
         dist = r["distances"][0][0]
-        if dist <= 0.20:
+        # Threshold mais tolerante p/ variações de frase (ex.: “trabalha com entrega?”)
+        if dist <= 0.35:
             return doc.split("RESPOSTA:\n",1)[-1].strip() if "RESPOSTA:" in doc else doc.strip()
         return None
     except Exception:
         return None
 
+# ========= RAG simplificado (opcional) =========
 def answer_rag(q: str):
     try:
         import chromadb
@@ -191,13 +209,11 @@ def answer_rag(q: str):
                 return (r.get("documents") or [[]])[0]
             except Exception:
                 return []
-        docs = []
-        docs += _q(col_ap)
-        docs += _q(col_pd)
+        docs = _q(col_ap) + _q(col_pd)
         if not docs:
             return None
         ctx = "\n\n".join(docs[:6])
-        if not oai:  # sem OpenAI
+        if not oai:
             return f"Base consultada. Encontrei {len(docs)} trechos, mas o gerador está fora. Posso te orientar manualmente com produtos/CEP."
         prompt = [
             {"role":"system","content":"Você é a assistente da Desfrut (sexshop em Manaus). Acolhedora, objetiva e educativa. Evite conteúdo explícito."},
@@ -208,7 +224,7 @@ def answer_rag(q: str):
     except Exception:
         return None
 
-# ====== ROTAS ======
+# ========= Páginas =========
 HTML = """
 <!doctype html><html><head><meta charset="utf-8"/><title>Desfrut IA</title>
 <style>body{font-family:Arial;max-width:820px;margin:40px auto;padding:0 16px}
@@ -234,18 +250,19 @@ def home(): return render_template_string(HTML)
 @app.get("/healthz")
 def healthz(): return jsonify(ok=True)
 
+# ========= /ask =========
 def _respond(question, cust_id=None, cust_name=None):
-    # 1) Q&A
+    # 1) Q&A (mais tolerante)
     a = answer_qna(question)
     if a: return humanize(a, cust_name)
-    # 2) Agente
+    # 2) Agente (agora entende “entrega/frete” sem CEP)
     a = agente_responder(question, cust_id, cust_name)
     if a: return humanize(a, cust_name)
     # 3) RAG
     a = answer_rag(question)
     if a: return humanize(a, cust_name)
-    # 4) Fallback final (SEM 500)
-    return humanize("Não encontrei isso na base agora. Posso te ajudar com frete (informe o CEP) ou disponibilidade/preço (me diga o nome/SKU).", cust_name)
+    # 4) Fallback final
+    return humanize("Posso te ajudar com frete (me informe o CEP) ou disponibilidade/preço (me diga o nome/SKU).", cust_name)
 
 @app.post("/ask")
 def ask():
@@ -255,20 +272,10 @@ def ask():
         if not q: return jsonify(error="Pergunta vazia."), 400
         ans = _respond(q, data.get("customer_id"), data.get("customer_name"))
         return jsonify(answer=ans), 200
-    except Exception as e:
-        # Nunca 500 p/ o bot do Whats
+    except Exception:
         return jsonify(answer=humanize("Tive uma instabilidade, mas já voltei. Pode repetir por favor?")), 200
 
-# ====== Treino via URL (sem shell) ======
-def _embed(text: str):
-    # (redeclara para escopo)
-    if not oai: return None
-    try:
-        e = oai.embeddings.create(model=EMBED_MODEL, input=text)
-        return e.data[0].embedding
-    except Exception:
-        return None
-
+# ========= Treino via URL e contagem =========
 def _train_qna(csv_path: str, reset=False) -> int:
     try:
         import chromadb
@@ -290,8 +297,8 @@ def _train_qna(csv_path: str, reset=False) -> int:
                 ids.append(os.urandom(8).hex())
                 vecs.append(_embed(q))
         if not docs: return 0
-        # se embeddings falharem, adiciona sem vetores (consulta vai cair no agente)
         try:
+            import math
             if all(v is not None for v in vecs):
                 col.add(documents=docs, metadatas=metas, ids=ids, embeddings=vecs)
             else:
@@ -315,7 +322,27 @@ def admin_train():
     except Exception as e:
         return jsonify(ok=False, error=str(e), path=path), 200  # nunca 500
 
-# ====== MAIN ======
+@app.get("/admin/qna_count")
+def admin_qna_count():
+    token = request.args.get("token","")
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        return jsonify(ok=False, error="forbidden"), 403
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
+        col = client.get_or_create_collection("qna")
+        # API 0.5.x tem count()
+        try:
+            c = col.count()
+        except Exception:
+            # fallback best-effort
+            res = col.get(ids=None, include=[])
+            c = len(res.get("ids", []))
+        return jsonify(ok=True, count=c)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+# ====== MAIN (dev) ======
 if __name__ == "__main__":
-    # Para dev local; no Render use gunicorn
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","10000")), debug=False)
