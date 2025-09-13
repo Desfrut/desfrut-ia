@@ -78,7 +78,7 @@ MICROCOPY = {
         "Fora de Manaus, o valor depende do **PAC/Sedex** e do CEP. Se me enviar o CEP, eu já te informo o valor certinho.",
         "Para o Interior do Amazonas, cobramos a taxa de embarque do barco de R$15,00; Se for por Ônibus o frete varia entre R$30 a R$60,00; Para outras cidades, a taxa varia por Correios (PAC/Sedex). Me envia o CEP que eu calculo."
     ],
-    "produto_lista": [
+    "produto_resumo_final": [
         "Separei opções:\n%%LINHAS%%\nSe quiser, já deixo reservado no seu nome. Qual você prefere?",
         "Olha o que encontrei:\n%%LINHAS%%\nMe fala o SKU ou a opção que você curtiu e eu já separo."
     ],
