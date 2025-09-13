@@ -51,11 +51,11 @@ def _saudacao():
 # ===== “Voz” com variações =====
 MICROCOPY = {
     "entrega_manaus_sem_cep": [
-        "%%SAUD%%, %%NOME%%! Entregamos em Manaus no mesmo dia 🛵, entre 45min a 1h, nosso Delivery funciona das 9h as 22h. Qual é o seu bairro? Te passo a janela certinha.",
+        "%%SAUD%%, %%NOME%%! Entregamos em Manaus no mesmo dia 🛵, entre 45min a 1h, nosso Delivery funciona das 9h as 22h. Qual é o seu bairro?",
         "%%SAUD%%, %%NOME%%! Sim, fazemos entrega hoje de imediado e sem taxa para toda Manaus (10h–22h). Qual bairro? Assim estimamos o tempo."
     ],
     "entrega_cep_manaus": [
-        "Perfeito, %%NOME%%! CEP de Manaus identificado. A entrega é no mesmo dia, entre 45min a 1h, nosso Delivery funciona das 9h as 22h. Me diz o bairro que estimo a janela 😉",
+        "Perfeito, %%NOME%%! CEP de Manaus identificado. A entrega é no mesmo dia, entre 45min a 1h, nosso Delivery funciona das 9h as 22h. Me diz o bairro que estimo o tempo 😉",
         "Show! Em Manaus a gente entrega hoje mesmo, de imediado e sem taxa. Qual o bairro pra eu estimar?"
     ],
     "entrega_cep_brasil": [
