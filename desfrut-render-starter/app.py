@@ -18,7 +18,7 @@ PRODUTOS_CSV   = os.getenv("PRODUTOS_CSV", "base_produtos.csv")
 ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "")
 
 # Contatos para handoff (ajuste nas ENV do Render)
-HUMAN_WHATS    = os.getenv("HUMAN_WHATS", "📲 (92) 9 9999-9999")
+HUMAN_WHATS    = os.getenv("HUMAN_WHATS", "📲 (92) 9 8424-5930")
 HUMAN_HORARIO  = os.getenv("HUMAN_HORARIO", "10h às 22h (Manaus)")
 
 app = Flask(__name__)
@@ -166,11 +166,13 @@ def _save_state(d):
     except Exception:
         pass
 
-# ========= Ferramentas / Agente =========
+# Detectores de intenção (entrega, taxa, humano, “use o bairro que já falei”, finalizar)
 CEP_RE      = re.compile(r"\b\d{5}-?\d{3}\b")
 ENTREGA_RE  = re.compile(r"\b(entrega|entregam|entregas|frete|envia|enviam|delivery|motoboy|retirada|retira|buscar)\b", re.I)
 TAXA_RE     = re.compile(r"\b(taxa|taxas|cobra|cobram|cobrar|cobrança|custa|valor da entrega|taxa de entrega)\b", re.I)
 HUMANO_RE   = re.compile(r"\b(humano|atendente|vendedor(a)?|pessoa|falar com alguém|falar com humano|suporte|telefone|número|numero|whats|whatsapp)\b", re.I)
+BAIRRO_CONFIRM_RE = re.compile(r"\b(informei (acima|antes)|já (informei|falei)|mesmo bairro|o mesmo|é esse|como disse)\b", re.I)
+FINALIZE_RE = re.compile(r"\b(finaliza(r)?|pode (enviar|acionar|chamar)|segue? (com|a) entrega|pode fechar|vamos fechar|quero que finalize|fechar pedido)\b", re.I)
 
 def tool_cotar_frete(cep: str, nome=None):
     cep = re.sub(r"\D", "", cep)
