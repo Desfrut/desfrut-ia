@@ -1,7 +1,6 @@
-# app.py — Desfrut IA v4
-# Fim do “loop do bairro”: estado conversacional com await/bairro/acionar
-# Checkout completo + Q&A + RAG + /admin/train + /admin/qna_count
-# /ask sempre 200 (resiliente)
+# app.py — Desfrut IA v4.1 (corrigido: 'await' -> 'next_step')
+# Fim do “loop do bairro” com estado conversacional + checkout completo
+# Q&A + RAG + /admin/train + /admin/qna_count | /ask sempre 200
 
 from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib, random
@@ -166,7 +165,9 @@ def _save_state(d):
             json.dump(d, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-def _st(db, key): return db.get(key, {"carrinho": [], "intent": None, "await": None})
+def _st(db, key): 
+    # substitui 'await' por 'next_step' no estado padrão
+    return db.get(key, {"carrinho": [], "intent": None, "next_step": None})
 
 # ===== Intenções/regex =====
 CEP_RE      = re.compile(r"\b\d{5}-?\d{3}\b")
@@ -236,7 +237,7 @@ def tool_finalizar_pedido(st, nome=None):
     return _mc("pedido_resumo_final", pedido_id=pedido_id,
                pag=st.get("pag","—"), modal=st.get("modal","—"), endereco=end)
 
-# ===== Agente (com estado 'await') =====
+# ===== Agente com 'next_step' =====
 def agente_responder(user_text: str, customer_id: str | None, customer_name: str | None):
     txt = (user_text or "").strip()
     if not txt:
@@ -253,52 +254,52 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
 
     # 0) Handoff humano
     if HUMANO_RE.search(txt):
-        save(intent="humano", await=None)
+        save(intent="humano", next_step=None)
         return _mc("handoff_humano")
 
     # 1) Confirmações curtas quando eu perguntei se aciono o motoboy
-    if st.get("await") == "acionar" and (CONFIRM_YES_RE.search(txt) or FINALIZE_RE.search(txt)):
-        save(intent="checkout", await=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
+    if st.get("next_step") == "acionar" and (CONFIRM_YES_RE.search(txt) or FINALIZE_RE.search(txt)):
+        save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
         return tool_criar_pedido(st)
 
     # 2) Pedido explícito para finalizar em qualquer momento
     if FINALIZE_RE.search(txt):
-        save(intent="checkout", await=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
+        save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
         return tool_criar_pedido(st)
 
     # 3) CEP explícito
     m = CEP_RE.search(txt)
     if m:
         cep = m.group(0)
-        save(cep=cep, intent="frete", await="bairro")
+        save(cep=cep, intent="frete", next_step="bairro")
         return tool_cotar_frete(cep, nome=customer_name)
 
     # 4) “já informei / mesmo bairro”
     if BAIRRO_CONFIRM_RE.search(txt):
         if st.get("bairro"):
-            save(await="acionar")
+            save(next_step="acionar")
             return _mc("entrega_bairro_follow", bairro=st["bairro"])
-        save(intent="frete", await="bairro")
+        save(intent="frete", next_step="bairro")
         return humanize("Consegue me dizer o bairro, por favor? Assim eu te passo a janela certinha.", customer_name)
 
     # 5) intenção entrega/frete sem CEP
     if ENTREGA_RE.search(txt):
         save(intent="frete")
         if st.get("bairro"):
-            save(await="acionar")
+            save(next_step="acionar")
             return _mc("entrega_bairro_follow", bairro=st["bairro"])
-        save(await="bairro")
+        save(next_step="bairro")
         return _mc("entrega_manaus_sem_cep", nome=customer_name)
 
     # 6) “tem taxa?”
     if TAXA_RE.search(txt):
         return tool_taxa_resposta(st.get("intent")=="frete", st.get("bairro"), nome=customer_name)
 
-    # 7) Capturar bairro somente quando eu pedi ('await' == 'bairro')
-    if st.get("await") == "bairro":
+    # 7) Capturar bairro somente quando eu pedi (next_step == 'bairro')
+    if st.get("next_step") == "bairro":
         if EXPLICIT_BAIRRO_RE.search(txt) or looks_like_bairro(txt):
             bairro_txt = re.sub(r"^(sou do|sou da|sou de|bairro|do bairro|da|de)\s+", "", txt, flags=re.I).strip()
-            save(bairro=bairro_txt, await="acionar")
+            save(bairro=bairro_txt, next_step="acionar")
             return _mc("entrega_bairro_follow", bairro=bairro_txt)
         # ainda aguardando bairro → re-pergunta gentil
         return humanize("Qual é o bairro, por favor? Assim eu calculo o tempo certinho 😊", customer_name)
