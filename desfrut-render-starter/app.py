@@ -1,9 +1,8 @@
-# app.py — Desfrut IA (humanizada, resiliente e com follow-up)
-# - Jeito de falar (voz) mais natural, com variações
-# - Entrega/frete entendido mesmo sem CEP
-# - Segue a conversa: guarda intenção (frete) e bairro informado depois
+# app.py — Desfrut IA (humanizada v2: taxa de entrega + handoff humano)
+# - Intenções: entrega (com/sem CEP), taxa de entrega, produtos, fechar pedido, falar com humano
+# - Follow-up: lembra que a conversa é sobre frete e bairro
 # - Q&A + RAG + /admin/train + /admin/qna_count
-# - /ask nunca responde 500 (sempre 200 com fallback simpático)
+# - Resiliente: /ask nunca 500
 
 from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib, random
@@ -17,6 +16,10 @@ CHROMA_DIR     = os.getenv("CHROMA_DIR", "/tmp/chroma")      # mude p/ /data/chr
 STATE_DB       = os.getenv("STATE_DB", "/tmp/state.json")    # mude p/ /data/state.json se tiver Disk
 PRODUTOS_CSV   = os.getenv("PRODUTOS_CSV", "base_produtos.csv")
 ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "")
+
+# Contatos para handoff (ajuste nas ENV do Render)
+HUMAN_WHATS    = os.getenv("HUMAN_WHATS", "📲 (92) 9 9999-9999")
+HUMAN_HORARIO  = os.getenv("HUMAN_HORARIO", "10h às 22h (Manaus)")
 
 app = Flask(__name__)
 
@@ -45,58 +48,69 @@ def _saudacao():
     except Exception:
         return "Oi"
 
-# ===== “Voz Desfrut” com variações =====
+# ===== “Voz” com variações =====
 MICROCOPY = {
     "entrega_manaus_sem_cep": [
-        "%%SAUD%%, %%NOME%%! Entregamos em Manaus no mesmo dia, das 10h as 22h 🛵. Me diz seu bairro que já te passo o tempo de entrega.",
-        "%%SAUD%%, %%NOME%%! Sim, rola entrega hoje em Manaus (das 10h as 22h). Qual é o bairro? Assim te estimamos o tempo certinho."
+        "%%SAUD%%, %%NOME%%! Entregamos em Manaus no mesmo dia 🛵, entre 45min a 1h, nosso Delivery funciona das 9h as 22h. Qual é o seu bairro? Te passo a janela certinha.",
+        "%%SAUD%%, %%NOME%%! Sim, fazemos entrega hoje de imediado e sem taxa para toda Manaus (10h–22h). Qual bairro? Assim estimamos o tempo."
     ],
     "entrega_cep_manaus": [
-        "Perfeito, %%NOME%%! CEP de Manaus identificado. A entrega é no mesmo dia, entre 45min a 1h30min no maximo apos o fechamento do seu pedido.",
-        "Show! Em Manaus a gente entrega hoje mesmo dia, entre 45min a 1h30min."
+        "Perfeito, %%NOME%%! CEP de Manaus identificado. A entrega é no mesmo dia, entre 45min a 1h, nosso Delivery funciona das 9h as 22h. Me diz o bairro que estimo a janela 😉",
+        "Show! Em Manaus a gente entrega hoje mesmo, de imediado e sem taxa. Qual o bairro pra eu estimar?"
     ],
     "entrega_cep_brasil": [
-        "Anotado, %%NOME%%! Para esse CEP eu consigo cotações via Correios (PAC/Sedex). Prefere rapidez (Sedex) ou economia (PAC)?",
-        "Beleza! Pra esse CEP faço PAC ou Sedex, você prefere entrega mais rápida ou mais econômica?"
+        "Anotado, %%NOME%%! Para esse CEP, envio por Correios (PAC/Sedex). Prefere rapidez (Sedex) ou economia (PAC)?",
+        "Beleza! Pra esse CEP faço PAC ou Sedex — você prefere mais rápido ou mais econômico?"
     ],
     "entrega_bairro_follow": [
-        "Bairro **%%BAIRRO%%**: normalmente 45min a 1h30min após o fechamento do pedido. No Delivery funciona das 10h as 22h",
-        "Pra **%%BAIRRO%%**, vamos finalizar o seu pedido?"
+        "Bairro **%%BAIRRO%%**: normalmente 45min a 1h após o fechamento do pedido (10h–22h). Posso acionar o motoboy?",
+        "Em **%%BAIRRO%%**, a janela costuma ser de 45min a 1h (10h–22h). Quer que eu finalize com a entrega?"
     ],
     "frete_politica_sem_cep": [
-        "%%SAUD%%, %%NOME%%! Atendemos Manaus com entrega no mesmo dia, discretas, sem taxa e de imediato das 10h as 22h. Interior do AM: Barco ou Ônibus e demais regiões: Correios (PAC/Sedex). Se me passar o CEP, eu já te digo prazo e valor.",
-        "%%SAUD%%, %%NOME%%! Em Manaus entregamos hoje; para outras cidades, envio por PAC/Sedex. Me manda o CEP que eu calculo tudo pra você."
+        "%%SAUD%%, %%NOME%%! Em Manaus entregamos no mesmo dia. Interior via Barco ou Ônibus. Demais cidades: Correios (PAC/Sedex). Se me passar o CEP, calculo prazo e valor.",
+        "%%SAUD%%, %%NOME%%! Manaus: entrega hoje mesmo; Interior via Barco ou Ônibus, outras regiões: PAC/Sedex. Me manda o CEP que eu cotar rapidinho."
+    ],
+    "frete_taxa_manaus": [
+        "Em Manaus, a entrega é no mesmo dia, entre 45min a 1h, nosso Delivery funciona das 9h as 22h e é **grátis**. Me diz o bairro que eu te passo a janela 😉",
+        "Dentro de Manaus a entrega sai **sem taxa** (10h–22h). Qual é o bairro?"
+    ],
+    "frete_taxa_brasil": [
+        "Fora de Manaus, o valor depende do **PAC/Sedex** e do CEP. Se me enviar o CEP, eu já te informo o valor certinho.",
+        "Para o Interior do Amazonas, cobramos a taxa de embarque do barco de R$15,00; Se for por Ônibus o frete varia entre R$30 a R$60,00; Para outras cidades, a taxa varia por Correios (PAC/Sedex). Me envia o CEP que eu calculo."
     ],
     "produto_lista": [
-        "Separei opções:\n%%LINHAS%%\nSe quiser, já deixo separado no seu nome. Qual você curtiu?",
-        "Olha o que encontrei:\n%%LINHAS%%\nMe fala o Codigo ou a opção preferida que eu já verifico pra você."
+        "Separei opções:\n%%LINHAS%%\nSe quiser, já deixo reservado no seu nome. Qual você prefere?",
+        "Olha o que encontrei:\n%%LINHAS%%\nMe fala o SKU ou a opção que você curtiu e eu já separo."
     ],
     "pedido_criado": [
-        "Pedido rascunho **%%ID%%** criado. Você prefere Pagar em Espécie, Pix ou Débito ou Cartão de Crédido (até 6x)? Vai querer entrega ou retirada?",
-        "Anotei o rascunho **%%ID%%**. Seguimos com qual forma de pagamento)? É pra entrega ou retirada?"
+        "Pedido rascunho **%%ID%%** criado. Preferir Dinheiro, Pix, débito ou cartão (até 6x)? Vai querer entrega ou retirada?",
+        "Anotei o rascunho **%%ID%%**. Vamos de Dinheiro, Pix, débito ou cartão (até 6x)? É pra entrega ou retirada?"
+    ],
+    "handoff_humano": [
+        "Claro, conecto você com uma Especialista agora ❤️  Contato: %%WHATS%% — atendimento %%HORARIO%%.",
+        "Sem problemas! Te passo com uma Especialista 🙌  Fale no %%WHATS%% (%%HORARIO%%)."
     ],
     "fallback": [
-        "Consigo te ajudar com o seu pedido ou verificar disponibilidade/preço (me diga o nome/código do produto).",
-        "Se quiser, já posso ver dicas ou checar um produto específico (nome/código)."
+        "Posso te ajudar com frete (me manda o CEP) ou disponibilidade/preço (me diga o nome/SKU).",
+        "Se preferir, já vejo frete (CEP) ou checo um produto específico (nome/SKU)."
     ]
 }
 
 def _mc(key, nome=None, bairro=None, pedido_id=None, linhas=None):
-    # pega um template ao acaso e preenche
     t = random.choice(MICROCOPY[key])
     t = t.replace("%%SAUD%%", _saudacao())
     t = t.replace("%%NOME%%", (nome.split(" ")[0] if nome else "").strip())
-    if bairro:   t = t.replace("%%BAIRRO%%", bairro.strip())
-    if pedido_id:t = t.replace("%%ID%%", pedido_id)
-    if linhas:   t = t.replace("%%LINHAS%%", linhas.strip())
+    t = t.replace("%%WHATS%%", HUMAN_WHATS)
+    t = t.replace("%%HORARIO%%", HUMAN_HORARIO)
+    if bairro:    t = t.replace("%%BAIRRO%%", bairro.strip())
+    if pedido_id: t = t.replace("%%ID%%", pedido_id)
+    if linhas:    t = t.replace("%%LINHAS%%", linhas.strip())
     return t
 
 def humanize(texto: str, nome: str | None = None) -> str:
-    # Se o texto já começar com “oi/olá/boa…”, não repete saudação
     primeiros = (texto or "")[:20].lower()
-    if any(primeiros.startswith(x) for x in ["oi", "olá", "ola", "boa "]):
+    if any(primeiros.startswith(x) for x in ["oi", "olá", "ola", "bom ", "boa "]):
         return texto
-    # Caso contrário, prefixa com saudação + nome
     pref = _saudacao()
     if nome:
         return f"{pref}, {nome.split(' ')[0]}! {texto}"
@@ -130,7 +144,6 @@ def buscar_produto(termo: str, n=3):
     if not PROD_CACHE:
         return []
     termo = (termo or "").strip()
-    # SKU primeiro
     for p in PROD_CACHE:
         if termo.lower() in str(p.get("sku","")).lower():
             return [p]
@@ -154,8 +167,10 @@ def _save_state(d):
         pass
 
 # ========= Ferramentas / Agente =========
-CEP_RE = re.compile(r"\b\d{5}-?\d{3}\b")
-ENTREGA_RE = re.compile(r"\b(entrega|entregam|entregas|frete|envia|enviam|delivery|motoboy|retirada|retira|buscar)\b", re.I)
+CEP_RE      = re.compile(r"\b\d{5}-?\d{3}\b")
+ENTREGA_RE  = re.compile(r"\b(entrega|entregam|entregas|frete|envia|enviam|delivery|motoboy|retirada|retira|buscar)\b", re.I)
+TAXA_RE     = re.compile(r"\b(taxa|taxas|cobra|cobram|cobrar|cobrança|custa|valor da entrega|taxa de entrega)\b", re.I)
+HUMANO_RE   = re.compile(r"\b(humano|atendente|vendedor(a)?|pessoa|falar com alguém|falar com humano|suporte|telefone|número|numero|whats|whatsapp)\b", re.I)
 
 def tool_cotar_frete(cep: str, nome=None):
     cep = re.sub(r"\D", "", cep)
@@ -165,6 +180,16 @@ def tool_cotar_frete(cep: str, nome=None):
 
 def tool_politica_entrega_sem_cep(nome=None):
     return _mc("frete_politica_sem_cep", nome=nome)
+
+def tool_taxa_resposta(intent_frete: bool, bairro: str | None, nome=None):
+    if bairro:
+        # Se já sabemos que é Manaus (bairro informado), seja direto:
+        return humanize("Dentro de Manaus a entrega é **grátis** entre 45min a 1h apos o fechamento do pedido. Deseja finalizar seu pedido?", nome)
+    if intent_frete:
+        # Estamos falando de frete, mas sem bairro/CEP ainda
+        return _mc("frete_taxa_manaus", nome=nome)
+    # Usuário falou de taxa sem estarmos em frete: dê visão geral
+    return humanize("Em Manaus a entrega é grátis de imediato, discreta, entre 45min a 1h após o fechamento do pedido; para o Interior do AM enviamos via Barco ou Ônibus, outras cidades, o valor depende do CEP (PAC/Sedex). Me manda o CEP que eu calculo rapidinho.", nome)
 
 def tool_ver_produto(termo: str, nome=None):
     itens = buscar_produto(termo, n=3)
@@ -184,12 +209,15 @@ def tool_criar_pedido(state: dict, nome=None):
     pedido_id = f"DFT-{str(abs(hash(json.dumps(state))) % 100000).zfill(5)}"
     return _mc("pedido_criado", nome=nome, pedido_id=pedido_id)
 
-def _salvar_bairro_followup(db, st_key, bairro_texto):
+def tool_handoff_humano(nome=None):
+    return _mc("handoff_humano", nome=nome)
+
+def _salvar_contexto(db, st_key, **kwargs):
     st = db.get(st_key, {"carrinho": []})
-    st["bairro"] = bairro_texto.strip()
-    st["intent"] = "frete"
+    st.update({k:v for k,v in kwargs.items() if v is not None})
     db[st_key] = st
     _save_state(db)
+    return st
 
 def agente_responder(user_text: str, customer_id: str | None, customer_name: str | None):
     txt = (user_text or "").strip()
@@ -200,49 +228,47 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
     db = _load_state()
     st = db.get(st_key, {"carrinho": []})
 
+    # 0) Handoff humano
+    if HUMANO_RE.search(txt):
+        _salvar_contexto(db, st_key, intent="humano")
+        return tool_handoff_humano(customer_name)
+
     # a) CEP explícito => cotação
     m = CEP_RE.search(txt)
     if m:
         cep = m.group(0)
-        st["cep"] = cep
-        st["intent"] = "frete"
-        db[st_key] = st
-        _save_state(db)
+        st = _salvar_contexto(db, st_key, cep=cep, intent="frete")
         return tool_cotar_frete(cep, nome=customer_name)
 
     # b) intenção de entrega/frete sem CEP
     if ENTREGA_RE.search(txt):
-        st["intent"] = "frete"
-        db[st_key] = st
-        _save_state(db)
+        st = _salvar_contexto(db, st_key, intent="frete")
         return _mc("entrega_manaus_sem_cep", nome=customer_name)
 
-    # c) se mensagem curta e já estamos falando de frete, trate como bairro
+    # c) “tem taxa?” / “cobra entrega?”
+    if TAXA_RE.search(txt):
+        intent_frete = st.get("intent") == "frete"
+        bairro = st.get("bairro")
+        return tool_taxa_resposta(intent_frete, bairro, nome=customer_name)
+
+    # d) se já estamos em frete e a mensagem é curta, trate como bairro
     if st.get("intent") == "frete" and len(txt) <= 60 and not CEP_RE.search(txt):
-        _salvar_bairro_followup(db, st_key, txt)
+        st = _salvar_contexto(db, st_key, bairro=txt)
         return _mc("entrega_bairro_follow", nome=customer_name, bairro=txt)
 
-    # d) ver produto (preço/estoque/SKU)
-    gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "codigo", "tamanho", "cor"]
+    # e) ver produto (preço/estoque/SKU)
+    gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "sku", "tamanho", "cor"]
     if any(g in txt.lower() for g in gatilhos):
         termo = re.sub(r"\b(tem|de|o|a|um|uma|preço|valor|do|da|no|na|sku|tamanho|cor|disponível|estoque)\b", "", txt, flags=re.I).strip() or txt
         return tool_ver_produto(termo, nome=customer_name)
 
-    # e) fechamento de pedido
+    # f) fechamento de pedido
     if re.search(r"\b(finalizar|fechar|comprar|fechar pedido|checkout)\b", txt, flags=re.I):
         return tool_criar_pedido(st, nome=customer_name)
 
     return None
 
 # ========= Q&A (Chroma) =========
-def _embed(text: str):
-    if not oai: return None
-    try:
-        e = oai.embeddings.create(model=EMBED_MODEL, input=text)
-        return e.data[0].embedding
-    except Exception:
-        return None
-
 def answer_qna(q: str):
     try:
         import chromadb
@@ -257,7 +283,7 @@ def answer_qna(q: str):
             return None
         doc  = r["documents"][0][0]
         dist = r["distances"][0][0]
-        if dist <= 0.35:  # mais tolerante
+        if dist <= 0.35:
             return doc.split("RESPOSTA:\n",1)[-1].strip() if "RESPOSTA:" in doc else doc.strip()
         return None
     except Exception:
@@ -322,16 +348,12 @@ def healthz(): return jsonify(ok=True)
 
 # ========= /ask =========
 def _respond(question, cust_id=None, cust_name=None):
-    # 1) Q&A (mais tolerante)
     a = answer_qna(question)
     if a: return humanize(a, cust_name)
-    # 2) Agente (com follow-up de entrega e variações)
     a = agente_responder(question, cust_id, cust_name)
-    if a: return a  # já vem humanizado pelos templates
-    # 3) RAG
+    if a: return a  # já vem humanizada pelos templates quando for o caso
     a = answer_rag(question)
     if a: return humanize(a, cust_name)
-    # 4) Fallback final
     return humanize(random.choice(MICROCOPY["fallback"]), cust_name)
 
 @app.post("/ask")
@@ -389,7 +411,7 @@ def admin_train():
         n = _train_qna(path, reset=reset)
         return jsonify(ok=True, inserted=n, reset=reset, path=path)
     except Exception as e:
-        return jsonify(ok=False, error=str(e), path=path), 200  # nunca 500
+        return jsonify(ok=False, error=str(e), path=path), 200
 
 @app.get("/admin/qna_count")
 def admin_qna_count():
