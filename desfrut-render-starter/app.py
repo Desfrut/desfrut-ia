@@ -14,7 +14,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEN_MODEL      = os.getenv("GEN_MODEL", "gpt-4o-mini")
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHROMA_DIR     = os.getenv("CHROMA_DIR", "/tmp/chroma")
-STATE_DB       = os.getenv("STATE_DB", "/tmp/state.json")
+STATE_DB       = os.getenv("STATE_DB", "/data/state.json")  # use /data (disk) no Render
 PRODUTOS_CSV   = os.getenv("PRODUTOS_CSV", "base_produtos.csv")
 ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "")
 HUMAN_WHATS    = os.getenv("HUMAN_WHATS", "📲 (92) 9 9999-9999")
@@ -151,11 +151,9 @@ def buscar_produto(termo: str, n=3):
     if not PROD_CACHE:
         return []
     termo = (termo or "").strip()
-    # SKU
     for p in PROD_CACHE:
         if termo.lower() in str(p.get("sku","")).lower():
             return [p]
-    # Fuzzy por nome
     nomes = [p.get('nome') or p.get('título') or p.get('titulo') or '' for p in PROD_CACHE]
     match = difflib.get_close_matches(termo, nomes, n=n, cutoff=0.5)
     res = [p for p in PROD_CACHE if (p.get('nome') or p.get('título') or p.get('titulo') or '') in match]
@@ -288,8 +286,7 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         if not st.get("carrinho"):
             p, msg = add_item_from_text(st, txt)
             save()  # salva carrinho se adicionou
-            if p:   # item adicionado agora
-                # segue pedindo pagamento/modal
+            if p:
                 pass
             else:
                 return humanize(msg, customer_name)
@@ -330,7 +327,6 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
     # 2) Confirma acionar motoboy → entra em checkout (mas pedirá item)
     if st.get("next_step") == "acionar" and (CONFIRM_YES_RE.search(txt) or FINALIZE_RE.search(txt)):
         save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
-        # Se já mencionou um produto nesta mesma mensagem, tenta adicionar
         p, msg = add_item_from_text(st, txt)
         save()
         if p:
