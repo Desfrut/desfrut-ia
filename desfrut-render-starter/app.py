@@ -1,7 +1,10 @@
-# app.py — Desfrut IA v4.3
-# Correções: prioridade ao CHECKOUT, entende "pix, entrega" no mesmo texto,
-# não volta ao fluxo de bairro após entrar no checkout.
-# Continua com Q&A + RAG + /admin/train + /admin/qna_count + /admin/version.
+# app.py — Desfrut IA v4.4
+# • Fluxo estável: bairro → acionar → checkout
+# • Não finaliza sem item (pede produto)
+# • Entende "pix, entrega" de uma vez
+# • "quanto tempo?" usa o último bairro
+# • Q&A + RAG + /admin/train + /admin/qna_count + /admin/version
+
 from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib, random
 from datetime import datetime
@@ -17,7 +20,7 @@ ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "")
 HUMAN_WHATS    = os.getenv("HUMAN_WHATS", "📲 (92) 9 9999-9999")
 HUMAN_HORARIO  = os.getenv("HUMAN_HORARIO", "10h às 22h (Manaus)")
 LOJA_ENDERECO  = os.getenv("LOJA_ENDERECO", "Rua Exemplo, 123 — Manaus")
-AGENT_VERSION  = "4.3"
+AGENT_VERSION  = "4.4"
 
 app = Flask(__name__)
 
@@ -69,23 +72,20 @@ MICROCOPY = {
     "entrega_bairro_follow": [
         "Bairro **%%BAIRRO%%**: normalmente 45–90 min após o fechamento (10h–22h). Quer que eu acione o motoboy?"
     ],
-    "frete_politica_sem_cep": [
-        "%%SAUD%%, %%NOME%%! Em Manaus entregamos hoje; outras cidades via Correios (PAC/Sedex). Se me passar o CEP, já calculo prazo e valor."
-    ],
     "frete_taxa_manaus": [
         "Em Manaus a entrega é **grátis** em horário comercial. Qual o bairro?"
     ],
-    "frete_taxa_brasil": [
-        "Fora de Manaus, o valor depende do CEP (PAC/Sedex). Me envia o CEP que eu calculo rapidinho."
-    ],
     "produto_lista": [
-        "Separei opções:\n%%LINHAS%%\nPosso reservar no seu nome. Qual você prefere?"
+        "Separei opções:\n%%LINHAS%%\nQual você quer? Pode me mandar o **SKU**."
+    ],
+    "pedir_produto": [
+        "Perfeito! Qual **produto** você deseja? Me diga o **nome** ou **SKU** que eu já separo."
     ],
     "pedido_criado": [
         "Pedido rascunho **%%ID%%** criado. Você prefere **Pix**, **dinheiro** ou **cartão** (débito/crédito até 6x)? É **entrega** ou **retirada**?"
     ],
     "pedido_resumo_final": [
-        "Fechado! Pedido **%%ID%%**:\n• Pagamento: **%%PAG%%**\n• Modalidade: **%%MODAL%%**\n%%ENDERECO%%\nJá vou separar e te atualizo o horário 👌"
+        "Fechado! Pedido **%%ID%%**:\n• Itens: **%%ITENS%%**\n• Pagamento: **%%PAG%%**\n• Modalidade: **%%MODAL%%**\n%%ENDERECO%%\nJá vou separar e te atualizo o horário 👌"
     ],
     "handoff_humano": [
         "Sem problema! Te conecto com uma especialista ❤️  Contato: %%WHATS%% — atendimento %%HORARIO%%."
@@ -101,20 +101,27 @@ MICROCOPY = {
     ],
     "fallback": [
         "Posso te ajudar com frete (me mande o CEP) ou disponibilidade/preço (me diga o nome/SKU)."
+    ],
+    "tempo_bairro": [
+        "Para **%%BAIRRO%%**, a janela costuma ser de **45–90 min** após fecharmos o pedido (10h–22h)."
     ]
 }
 
 def _mc(key, **kws):
     t = random.choice(MICROCOPY[key])
-    t = t.replace("%%SAUD%%", _saudacao())
-    t = t.replace("%%NOME%%", (kws.get("nome","") or "").split(" ")[0])
-    t = t.replace("%%BAIRRO%%", kws.get("bairro","") or "")
-    t = t.replace("%%ID%%", kws.get("pedido_id","") or "")
-    t = t.replace("%%PAG%%", kws.get("pag","") or "")
-    t = t.replace("%%MODAL%%", kws.get("modal","") or "")
-    t = t.replace("%%WHATS%%", HUMAN_WHATS)
-    t = t.replace("%%HORARIO%%", HUMAN_HORARIO)
-    t = t.replace("%%ENDERECO%%", kws.get("endereco","").strip())
+    repl = {
+        "%%SAUD%%": _saudacao(),
+        "%%NOME%%": (kws.get("nome","") or "").split(" ")[0],
+        "%%BAIRRO%%": kws.get("bairro","") or "",
+        "%%ID%%": kws.get("pedido_id","") or "",
+        "%%PAG%%": kws.get("pag","") or "",
+        "%%MODAL%%": kws.get("modal","") or "",
+        "%%ITENS%%": kws.get("itens","") or "",
+        "%%WHATS%%": HUMAN_WHATS,
+        "%%HORARIO%%": HUMAN_HORARIO,
+        "%%ENDERECO%%": (kws.get("endereco","") or "").strip(),
+    }
+    for k,v in repl.items(): t = t.replace(k, v)
     return t
 
 # ===== Embeddings (Q&A/RAG) =====
@@ -144,13 +151,34 @@ def buscar_produto(termo: str, n=3):
     if not PROD_CACHE:
         return []
     termo = (termo or "").strip()
+    # SKU
     for p in PROD_CACHE:
         if termo.lower() in str(p.get("sku","")).lower():
             return [p]
+    # Fuzzy por nome
     nomes = [p.get('nome') or p.get('título') or p.get('titulo') or '' for p in PROD_CACHE]
     match = difflib.get_close_matches(termo, nomes, n=n, cutoff=0.5)
     res = [p for p in PROD_CACHE if (p.get('nome') or p.get('título') or p.get('titulo') or '') in match]
     return res[:n]
+
+def add_item_from_text(st, txt):
+    termo = re.sub(r"\b(tem|de|o|a|um|uma|preço|valor|do|da|no|na|sku|tamanho|cor|disponível|estoque)\b", "", txt, flags=re.I).strip() or txt
+    itens = buscar_produto(termo, n=3)
+    if not itens: return None, "Não encontrei esse item. Pode me enviar o **nome exato** ou o **SKU**?"
+    if len(itens) == 1:
+        p = itens[0]
+        nomep = p.get('nome') or p.get('título') or p.get('titulo') or 'Produto'
+        sku   = p.get('sku') or '—'
+        st.setdefault("carrinho", []).append({"sku": sku, "nome": nomep})
+        return p, f"Adicionei **{nomep} (SKU {sku})** ao carrinho."
+    # lista
+    linhas = []
+    for p in itens:
+        nomep = p.get('nome') or p.get('título') or p.get('titulo') or 'Produto'
+        sku   = p.get('sku') or '—'
+        preco = p.get('preco') or p.get('preço') or p.get('valor') or 'sob consulta'
+        linhas.append(f"• {nomep} (SKU {sku}) – R$ {preco}")
+    return None, _mc("produto_lista", linhas="\n".join(linhas))
 
 # ===== Memória =====
 def _load_state():
@@ -165,8 +193,8 @@ def _save_state(d):
             json.dump(d, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-def _st(db, key): 
-    return db.get(key, {"carrinho": [], "intent": None, "next_step": None})
+def _st(db, key):
+    return db.get(key, {"carrinho": [], "intent": None, "next_step": None, "stage": None})
 
 # ===== Regex =====
 CEP_RE      = re.compile(r"\b\d{5}-?\d{3}\b")
@@ -175,12 +203,13 @@ TAXA_RE     = re.compile(r"\b(taxa|taxas|cobra|cobram|cobrar|cobrança|custa|val
 HUMANO_RE   = re.compile(r"\b(humano|atendente|vendedor(a)?|pessoa|falar com humano|suporte|telefone|n(ú|u)mero|whats|whatsapp)\b", re.I)
 BAIRRO_CONFIRM_RE = re.compile(r"\b(informei (acima|antes)|ja? informei|mesmo bairro|o mesmo|como disse)\b", re.I)
 FINALIZE_RE = re.compile(r"\b(finaliza(r)?|pode (enviar|acionar|chamar)|segue? (com|a) entrega|pode fechar|vamos fechar|quero (fechar|finalize)|fechar pedido|checkout)\b", re.I)
-CONFIRM_YES_RE = re.compile(r"^(sim|pode|ok|isso|bora|vamos)$", re.I)  # sem "quero"
+CONFIRM_YES_RE = re.compile(r"^(sim|pode|ok|isso|bora|vamos)$", re.I)
 PAYMENT_RE  = re.compile(r"\b(pix|dinheiro|d(é|e)b(í|i)to|cr(é|e)dito|cart(ã|a)o|6x|6 parcelas|parcelar)\b", re.I)
 RETIRADA_RE = re.compile(r"\b(retira(da)?|pegar na loja|buscar na loja|retirar na loja)\b", re.I)
 ENTREGA_CHOICE_RE = re.compile(r"\b(entrega|motoboy|enviar)\b", re.I)
 ADDRESS_HINT_RE = re.compile(r"\b(rua|avenida|av\.?|travessa|condom(í|i)nio|residencial|bloco|casa|apto|apartamento|n(º|o)|numero|número)\b", re.I)
 EXPLICIT_BAIRRO_RE = re.compile(r"\b(bairro|sou d[eo]|moro (em|na|no)|estou (em|na|no)|no bairro|do bairro|da zona|na zona)\b", re.I)
+TEMPO_RE    = re.compile(r"\b(quanto tempo|em quanto tempo|qual o tempo|prazo|demora)\b", re.I)
 
 STOPWORDS_SHORT = {"ola","olá","oi","sim","ok","blz","tá","ta","beleza","boa","bom","entrega","entrega hoje"}
 
@@ -192,53 +221,52 @@ def looks_like_bairro(txt: str) -> bool:
         return False
     return True
 
-# ===== Ferramentas =====
+# ===== Ferramentas de frete/pedido =====
 def tool_cotar_frete(cep: str, nome=None):
     cep = re.sub(r"\D", "", cep)
     if cep.startswith("690"):
         return _mc("entrega_cep_manaus", nome=nome)
     return _mc("entrega_cep_brasil", nome=nome)
 
-def tool_taxa_resposta(intent_frete: bool, bairro: str | None, nome=None):
-    if bairro:
-        return humanize("Dentro de Manaus a entrega é **grátis** em horário comercial. Posso acionar o motoboy?", nome)
-    if intent_frete:
-        return _mc("frete_taxa_manaus", nome=nome)
-    return humanize("Em Manaus a entrega é grátis; para outras cidades, o valor depende do CEP (PAC/Sedex). Me manda o CEP que eu calculo já.", nome)
-
-def tool_ver_produto(termo: str, nome=None):
-    itens = buscar_produto(termo, n=3)
-    if not itens:
-        return humanize("Não encontrei esse item. Pode me enviar o nome exato ou o SKU?", nome)
-    linhas = []
-    for p in itens:
-        nomep   = p.get('nome') or p.get('título') or p.get('titulo') or 'Produto'
-        sku     = p.get('sku') or '—'
-        preco   = p.get('preco') or p.get('preço') or p.get('valor') or 'sob consulta'
-        estoque = p.get('estoque') or p.get('qtd') or p.get('quantidade') or ''
-        linha = f"• {nomep} (SKU {sku}) – R$ {preco}" + (f" — estoque: {estoque}" if estoque else "")
-        linhas.append(linha)
-    return _mc("produto_lista", linhas="\n".join(linhas))
-
 def _novo_pedido_id(st): return f"DFT-{str(abs(hash(json.dumps(st))) % 100000).zfill(5)}"
+
 def tool_criar_pedido(st, nome=None):
-    pedido_id = _novo_pedido_id(st)
-    return _mc("pedido_criado", pedido_id=pedido_id)
+    if not st.get("pedido_id"):
+        st["pedido_id"] = _novo_pedido_id(st)
+    return _mc("pedido_criado", pedido_id=st["pedido_id"])
+
+def _itens_txt(st):
+    itens = st.get("carrinho") or []
+    if not itens: return "(definir)"
+    return ", ".join([f'{i.get("nome","Item")} (SKU {i.get("sku","—")})' for i in itens])
+
 def tool_finalizar_pedido(st, nome=None):
+    # Não finaliza se não houver item
+    if not st.get("carrinho"):
+        return _mc("pedir_produto")
     pedido_id = st.get("pedido_id") or _novo_pedido_id(st)
     st["pedido_id"] = pedido_id
+    st["stage"] = "finalizado"
     if st.get("modal") == "Retirada":
         end = f"• Retirada: **{LOJA_ENDERECO}**"
     else:
         end = f"• Endereço: **{st.get('endereco','(aguardando)')}**"
-    return _mc("pedido_resumo_final", pedido_id=pedido_id,
-               pag=st.get("pag","—"), modal=st.get("modal","—"), endereco=end)
+    return _mc("pedido_resumo_final",
+               pedido_id=pedido_id,
+               itens=_itens_txt(st),
+               pag=st.get("pag","—"),
+               modal=st.get("modal","—"),
+               endereco=end)
+
+def tempo_estimada(st):
+    b = st.get("bairro")
+    if not b: return None
+    return _mc("tempo_bairro", bairro=b)
 
 # ===== Agente =====
 def agente_responder(user_text: str, customer_id: str | None, customer_name: str | None):
     txt = (user_text or "").strip()
-    if not txt:
-        return None
+    if not txt: return None
 
     st_key = customer_id or "anon"
     db = _load_state()
@@ -249,14 +277,24 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         db[st_key] = st
         _save_state(db)
 
-    # 0) Handoff humano (sempre primeiro)
+    # 0) Handoff humano
     if HUMANO_RE.search(txt):
         save(intent="humano", next_step=None)
         return _mc("handoff_humano")
 
-    # 1) CHECKOUT TEM PRIORIDADE (antes de qualquer regra de frete/entrega)
+    # 1) CHECKOUT tem prioridade
     if st.get("intent") == "checkout":
-        # detectar tudo que couber na mesma mensagem
+        # Primeiro: garantir item
+        if not st.get("carrinho"):
+            p, msg = add_item_from_text(st, txt)
+            save()  # salva carrinho se adicionou
+            if p:   # item adicionado agora
+                # segue pedindo pagamento/modal
+                pass
+            else:
+                return humanize(msg, customer_name)
+
+        # Pagamento/modal/endereço
         pag = None
         if PAYMENT_RE.search(txt):
             pag = "Pix" if re.search(r"pix", txt, re.I) else \
@@ -271,15 +309,17 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         if ADDRESS_HINT_RE.search(txt) and len(txt) > 8:
             save(endereco=txt, modal=st.get("modal") or "Entrega")
 
-        # decidir próximos passos/finalização
+        # Finaliza se tiver tudo
         if st.get("modal") == "Retirada" and st.get("pag"):
-            return tool_finalizar_pedido(st, nome=customer_name)
+            return tool_finalizar_pedido(st, customer_name)
         if st.get("modal") == "Entrega" and st.get("pag") and st.get("endereco"):
-            return tool_finalizar_pedido(st, nome=customer_name)
+            return tool_finalizar_pedido(st, customer_name)
 
         # pedir o que falta
         if not st.get("pag") and not st.get("modal"):
-            return humanize("Perfeito! Prefere **Pix**, **dinheiro** ou **cartão**? E será **entrega** ou **retirada**?", customer_name)
+            return humanize("Perfeito! Me diga **produto (nome ou SKU)** — se já escolheu. E prefere **Pix**, **dinheiro** ou **cartão**? Será **entrega** ou **retirada**?", customer_name)
+        if not st.get("carrinho"):
+            return humanize(_mc("pedir_produto"), customer_name)
         if not st.get("pag"):
             return humanize(random.choice(MICROCOPY["ask_payment"]), customer_name)
         if not st.get("modal"):
@@ -287,39 +327,48 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         if st.get("modal") == "Entrega" and not st.get("endereco"):
             return humanize(random.choice(MICROCOPY["address_pedido"]), customer_name)
 
-    # 2) Confirmações curtas quando perguntei se aciono o motoboy
+    # 2) Confirma acionar motoboy → entra em checkout (mas pedirá item)
     if st.get("next_step") == "acionar" and (CONFIRM_YES_RE.search(txt) or FINALIZE_RE.search(txt)):
         save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
-        return tool_criar_pedido(st)
+        # Se já mencionou um produto nesta mesma mensagem, tenta adicionar
+        p, msg = add_item_from_text(st, txt)
+        save()
+        if p:
+            return tool_criar_pedido(st, customer_name)
+        return humanize(_mc("pedir_produto"), customer_name)
 
-    # 3) Pedido explícito para finalizar em qualquer momento
+    # 3) Pedido explícito para finalizar a qualquer momento
     if FINALIZE_RE.search(txt):
         save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
-        return tool_criar_pedido(st)
+        p, msg = add_item_from_text(st, txt)
+        save()
+        if p:
+            return tool_criar_pedido(st, customer_name)
+        return humanize(_mc("pedir_produto"), customer_name)
 
-    # 4) CEP explícito
+    # 4) CEP
     m = CEP_RE.search(txt)
     if m:
         cep = m.group(0)
         save(cep=cep, intent="frete", next_step="bairro")
         return tool_cotar_frete(cep, nome=customer_name)
 
-    # 5) Bairro explícito (ex.: "estou na Cidade Nova") — só se NÃO estiver em checkout
-    if st.get("intent") != "checkout" and EXPLICIT_BAIRRO_RE.search(txt):
+    # 5) Bairro explícito
+    if EXPLICIT_BAIRRO_RE.search(txt):
         bairro_txt = re.sub(r"^(sou do|sou da|sou de|moro (em|na|no)|estou (em|na|no)|bairro|do bairro|da|de)\s+", "", txt, flags=re.I).strip()
         save(intent="frete", bairro=bairro_txt, next_step="acionar")
         return _mc("entrega_bairro_follow", bairro=bairro_txt)
 
-    # 6) “já informei / mesmo bairro” — só se NÃO estiver em checkout
-    if st.get("intent") != "checkout" and BAIRRO_CONFIRM_RE.search(txt):
+    # 6) “já informei / mesmo bairro”
+    if BAIRRO_CONFIRM_RE.search(txt):
         if st.get("bairro"):
             save(next_step="acionar")
             return _mc("entrega_bairro_follow", bairro=st["bairro"])
         save(intent="frete", next_step="bairro")
         return humanize("Consegue me dizer o bairro, por favor? Assim eu te passo a janela certinha.", customer_name)
 
-    # 7) intenção entrega/frete sem CEP — só se NÃO estiver em checkout
-    if st.get("intent") != "checkout" and ENTREGA_RE.search(txt):
+    # 7) intenção entrega/frete sem CEP
+    if ENTREGA_RE.search(txt):
         save(intent="frete")
         if st.get("bairro"):
             save(next_step="acionar")
@@ -329,21 +378,22 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
 
     # 8) “tem taxa?”
     if TAXA_RE.search(txt):
-        return tool_taxa_resposta(st.get("intent")=="frete", st.get("bairro"), nome=customer_name)
+        if st.get("bairro"):
+            return humanize("Dentro de Manaus a entrega é **grátis** em horário comercial. Posso acionar o motoboy?", customer_name)
+        return humanize("Em Manaus a entrega é grátis; para outras cidades, o valor depende do CEP (PAC/Sedex). Me manda o CEP que eu calculo já.", customer_name)
 
-    # 9) Capturar bairro quando pedi (next_step == 'bairro')
-    if st.get("next_step") == "bairro":
-        if looks_like_bairro(txt):
-            bairro_txt = re.sub(r"^(sou do|sou da|sou de|bairro|do bairro|da|de)\s+", "", txt, flags=re.I).strip()
-            save(bairro=bairro_txt, next_step="acionar")
-            return _mc("entrega_bairro_follow", bairro=bairro_txt)
-        return humanize("Qual é o bairro, por favor? Assim eu calculo o tempo certinho 😊", customer_name)
+    # 9) “quanto tempo?”
+    if TEMPO_RE.search(txt):
+        t = tempo_estimada(st)
+        if t: return humanize(t, customer_name)
+        return humanize("Me diz o bairro e eu te passo a janela certinha 👍", customer_name)
 
-    # 10) Produtos
+    # 10) Produtos (fora do checkout): listar/sugerir
     gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "sku", "tamanho", "cor"]
     if any(g in txt.lower() for g in gatilhos):
-        termo = re.sub(r"\b(tem|de|o|a|um|uma|preço|valor|do|da|no|na|sku|tamanho|cor|disponível|estoque)\b", "", txt, flags=re.I).strip() or txt
-        return tool_ver_produto(termo, nome=customer_name)
+        p, msg = add_item_from_text(st, txt)
+        save()
+        return humanize(msg, customer_name)
 
     return None
 
