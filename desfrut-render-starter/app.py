@@ -1,7 +1,7 @@
-# app.py — Desfrut IA v4.2 (fim do loop do bairro + confirma "quero" + captura "estou na ...")
-# Agente humanizado + checkout completo + Q&A + RAG + /admin/train + /admin/qna_count + /admin/version
-# /ask sempre 200
-
+# app.py — Desfrut IA v4.3
+# Correções: prioridade ao CHECKOUT, entende "pix, entrega" no mesmo texto,
+# não volta ao fluxo de bairro após entrar no checkout.
+# Continua com Q&A + RAG + /admin/train + /admin/qna_count + /admin/version.
 from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib, random
 from datetime import datetime
@@ -17,11 +17,11 @@ ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "")
 HUMAN_WHATS    = os.getenv("HUMAN_WHATS", "📲 (92) 9 9999-9999")
 HUMAN_HORARIO  = os.getenv("HUMAN_HORARIO", "10h às 22h (Manaus)")
 LOJA_ENDERECO  = os.getenv("LOJA_ENDERECO", "Rua Exemplo, 123 — Manaus")
-AGENT_VERSION  = "4.2"
+AGENT_VERSION  = "4.3"
 
 app = Flask(__name__)
 
-# ===== OpenAI opcional (para Q&A/RAG) =====
+# ===== OpenAI (opcional p/ Q&A/RAG) =====
 oai = None
 if OPENAI_API_KEY:
     try:
@@ -117,7 +117,7 @@ def _mc(key, **kws):
     t = t.replace("%%ENDERECO%%", kws.get("endereco","").strip())
     return t
 
-# ===== Embeddings (para Q&A/RAG) =====
+# ===== Embeddings (Q&A/RAG) =====
 def _embed(text: str):
     if not oai: return None
     try:
@@ -166,22 +166,20 @@ def _save_state(d):
     except Exception:
         pass
 def _st(db, key): 
-    # estado padrão com 'next_step'
     return db.get(key, {"carrinho": [], "intent": None, "next_step": None})
 
-# ===== Intenções/regex =====
+# ===== Regex =====
 CEP_RE      = re.compile(r"\b\d{5}-?\d{3}\b")
 ENTREGA_RE  = re.compile(r"\b(entrega|entregam|entregas|frete|enviar|envia|delivery|motoboy|retirada|retira|buscar)\b", re.I)
 TAXA_RE     = re.compile(r"\b(taxa|taxas|cobra|cobram|cobrar|cobrança|custa|valor da entrega|taxa de entrega)\b", re.I)
 HUMANO_RE   = re.compile(r"\b(humano|atendente|vendedor(a)?|pessoa|falar com humano|suporte|telefone|n(ú|u)mero|whats|whatsapp)\b", re.I)
 BAIRRO_CONFIRM_RE = re.compile(r"\b(informei (acima|antes)|ja? informei|mesmo bairro|o mesmo|como disse)\b", re.I)
 FINALIZE_RE = re.compile(r"\b(finaliza(r)?|pode (enviar|acionar|chamar)|segue? (com|a) entrega|pode fechar|vamos fechar|quero (fechar|finalize)|fechar pedido|checkout)\b", re.I)
-CONFIRM_YES_RE = re.compile(r"^(sim|pode|ok|isso|bora|vamos)$", re.I)
+CONFIRM_YES_RE = re.compile(r"^(sim|pode|ok|isso|bora|vamos)$", re.I)  # sem "quero"
 PAYMENT_RE  = re.compile(r"\b(pix|dinheiro|d(é|e)b(í|i)to|cr(é|e)dito|cart(ã|a)o|6x|6 parcelas|parcelar)\b", re.I)
 RETIRADA_RE = re.compile(r"\b(retira(da)?|pegar na loja|buscar na loja|retirar na loja)\b", re.I)
 ENTREGA_CHOICE_RE = re.compile(r"\b(entrega|motoboy|enviar)\b", re.I)
 ADDRESS_HINT_RE = re.compile(r"\b(rua|avenida|av\.?|travessa|condom(í|i)nio|residencial|bloco|casa|apto|apartamento|n(º|o)|numero|número)\b", re.I)
-# captura explícita de bairro (agora inclui "estou na/no/em ...")
 EXPLICIT_BAIRRO_RE = re.compile(r"\b(bairro|sou d[eo]|moro (em|na|no)|estou (em|na|no)|no bairro|do bairro|da zona|na zona)\b", re.I)
 
 STOPWORDS_SHORT = {"ola","olá","oi","sim","ok","blz","tá","ta","beleza","boa","bom","entrega","entrega hoje"}
@@ -223,11 +221,9 @@ def tool_ver_produto(termo: str, nome=None):
     return _mc("produto_lista", linhas="\n".join(linhas))
 
 def _novo_pedido_id(st): return f"DFT-{str(abs(hash(json.dumps(st))) % 100000).zfill(5)}"
-
 def tool_criar_pedido(st, nome=None):
     pedido_id = _novo_pedido_id(st)
     return _mc("pedido_criado", pedido_id=pedido_id)
-
 def tool_finalizar_pedido(st, nome=None):
     pedido_id = st.get("pedido_id") or _novo_pedido_id(st)
     st["pedido_id"] = pedido_id
@@ -238,7 +234,7 @@ def tool_finalizar_pedido(st, nome=None):
     return _mc("pedido_resumo_final", pedido_id=pedido_id,
                pag=st.get("pag","—"), modal=st.get("modal","—"), endereco=end)
 
-# ===== Agente (estado: next_step) =====
+# ===== Agente =====
 def agente_responder(user_text: str, customer_id: str | None, customer_name: str | None):
     txt = (user_text or "").strip()
     if not txt:
@@ -253,44 +249,77 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         db[st_key] = st
         _save_state(db)
 
-    # 0) Handoff humano
+    # 0) Handoff humano (sempre primeiro)
     if HUMANO_RE.search(txt):
         save(intent="humano", next_step=None)
         return _mc("handoff_humano")
 
-    # 1) Confirmações curtas quando perguntei se aciono o motoboy
+    # 1) CHECKOUT TEM PRIORIDADE (antes de qualquer regra de frete/entrega)
+    if st.get("intent") == "checkout":
+        # detectar tudo que couber na mesma mensagem
+        pag = None
+        if PAYMENT_RE.search(txt):
+            pag = "Pix" if re.search(r"pix", txt, re.I) else \
+                  "Dinheiro" if re.search(r"dinheiro", txt, re.I) else "Cartão (débito/crédito até 6x)"
+            save(pag=pag)
+
+        modal = None
+        if RETIRADA_RE.search(txt): modal = "Retirada"
+        elif ENTREGA_CHOICE_RE.search(txt): modal = "Entrega"
+        if modal: save(modal=modal)
+
+        if ADDRESS_HINT_RE.search(txt) and len(txt) > 8:
+            save(endereco=txt, modal=st.get("modal") or "Entrega")
+
+        # decidir próximos passos/finalização
+        if st.get("modal") == "Retirada" and st.get("pag"):
+            return tool_finalizar_pedido(st, nome=customer_name)
+        if st.get("modal") == "Entrega" and st.get("pag") and st.get("endereco"):
+            return tool_finalizar_pedido(st, nome=customer_name)
+
+        # pedir o que falta
+        if not st.get("pag") and not st.get("modal"):
+            return humanize("Perfeito! Prefere **Pix**, **dinheiro** ou **cartão**? E será **entrega** ou **retirada**?", customer_name)
+        if not st.get("pag"):
+            return humanize(random.choice(MICROCOPY["ask_payment"]), customer_name)
+        if not st.get("modal"):
+            return humanize(random.choice(MICROCOPY["ask_delivery"]), customer_name)
+        if st.get("modal") == "Entrega" and not st.get("endereco"):
+            return humanize(random.choice(MICROCOPY["address_pedido"]), customer_name)
+
+    # 2) Confirmações curtas quando perguntei se aciono o motoboy
     if st.get("next_step") == "acionar" and (CONFIRM_YES_RE.search(txt) or FINALIZE_RE.search(txt)):
         save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
         return tool_criar_pedido(st)
 
-    # 2) Pedido explícito para finalizar em qualquer momento
+    # 3) Pedido explícito para finalizar em qualquer momento
     if FINALIZE_RE.search(txt):
         save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
         return tool_criar_pedido(st)
 
-    # 3) CEP explícito
+    # 4) CEP explícito
     m = CEP_RE.search(txt)
     if m:
         cep = m.group(0)
         save(cep=cep, intent="frete", next_step="bairro")
         return tool_cotar_frete(cep, nome=customer_name)
 
-    # 4) Bairro explícito em qualquer momento (ex.: "estou na Cidade Nova")
-    if EXPLICIT_BAIRRO_RE.search(txt):
+    # 5) Bairro explícito (ex.: "estou na Cidade Nova") — só se NÃO estiver em checkout
+    if st.get("intent") != "checkout" and EXPLICIT_BAIRRO_RE.search(txt):
         bairro_txt = re.sub(r"^(sou do|sou da|sou de|moro (em|na|no)|estou (em|na|no)|bairro|do bairro|da|de)\s+", "", txt, flags=re.I).strip()
         save(intent="frete", bairro=bairro_txt, next_step="acionar")
         return _mc("entrega_bairro_follow", bairro=bairro_txt)
 
-    # 5) “já informei / mesmo bairro”
-    if BAIRRO_CONFIRM_RE.search(txt):
+    # 6) “já informei / mesmo bairro” — só se NÃO estiver em checkout
+    if st.get("intent") != "checkout" and BAIRRO_CONFIRM_RE.search(txt):
         if st.get("bairro"):
             save(next_step="acionar")
             return _mc("entrega_bairro_follow", bairro=st["bairro"])
         save(intent="frete", next_step="bairro")
         return humanize("Consegue me dizer o bairro, por favor? Assim eu te passo a janela certinha.", customer_name)
 
-    # 6) intenção entrega/frete sem CEP
-    if ENTREGA_RE.search(txt):
+    # 7) intenção entrega/frete sem CEP — só se NÃO estiver em checkout
+    if st.get("intent") != "checkout" and ENTREGA_RE.search(txt):
         save(intent="frete")
         if st.get("bairro"):
             save(next_step="acionar")
@@ -298,60 +327,17 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         save(next_step="bairro")
         return _mc("entrega_manaus_sem_cep", nome=customer_name)
 
-    # 7) “tem taxa?”
+    # 8) “tem taxa?”
     if TAXA_RE.search(txt):
         return tool_taxa_resposta(st.get("intent")=="frete", st.get("bairro"), nome=customer_name)
 
-    # 8) Capturar bairro somente quando eu pedi (next_step == 'bairro')
+    # 9) Capturar bairro quando pedi (next_step == 'bairro')
     if st.get("next_step") == "bairro":
         if looks_like_bairro(txt):
             bairro_txt = re.sub(r"^(sou do|sou da|sou de|bairro|do bairro|da|de)\s+", "", txt, flags=re.I).strip()
             save(bairro=bairro_txt, next_step="acionar")
             return _mc("entrega_bairro_follow", bairro=bairro_txt)
-        # ainda aguardando bairro → re-pergunta gentil
         return humanize("Qual é o bairro, por favor? Assim eu calculo o tempo certinho 😊", customer_name)
-
-    # 9) Checkout: pagamento / modalidade / endereço
-    if st.get("intent") == "checkout":
-        if PAYMENT_RE.search(txt):
-            pag = "Pix" if re.search(r"pix", txt, re.I) else \
-                  "Dinheiro" if re.search(r"dinheiro", txt, re.I) else "Cartão (débito/crédito até 6x)"
-            save(pag=pag)
-            if st.get("modal") == "Retirada":
-                return tool_finalizar_pedido(st, nome=customer_name)
-            if st.get("modal") == "Entrega":
-                if st.get("endereco"):
-                    return tool_finalizar_pedido(st, nome=customer_name)
-                return humanize(random.choice(MICROCOPY["address_pedido"]), customer_name)
-            return humanize(random.choice(MICROCOPY["ask_delivery"]), customer_name)
-
-        if RETIRADA_RE.search(txt):
-            save(modal="Retirada", endereco=LOJA_ENDERECO)
-            if st.get("pag"):
-                return tool_finalizar_pedido(st, nome=customer_name)
-            return humanize(random.choice(MICROCOPY["ask_payment"]), customer_name)
-
-        if ENTREGA_CHOICE_RE.search(txt):
-            save(modal="Entrega")
-            if st.get("endereco") and st.get("pag"):
-                return tool_finalizar_pedido(st, nome=customer_name)
-            if not st.get("endereco"):
-                return humanize(random.choice(MICROCOPY["address_pedido"]), customer_name)
-            if not st.get("pag"):
-                return humanize(random.choice(MICROCOPY["ask_payment"]), customer_name)
-
-        if ADDRESS_HINT_RE.search(txt) and len(txt) > 8:
-            save(endereco=txt, modal=st.get("modal") or "Entrega")
-            if st.get("pag"):
-                return tool_finalizar_pedido(st, nome=customer_name)
-            return humanize(random.choice(MICROCOPY["ask_payment"]), customer_name)
-
-        faltantes = []
-        if not st.get("pag"): faltantes.append("pagamento")
-        if not st.get("modal"): faltantes.append("entrega ou retirada")
-        if st.get("modal") == "Entrega" and not st.get("endereco"): faltantes.append("endereço")
-        if faltantes:
-            return humanize("Me diga por favor: " + " / ".join(faltantes) + ".", customer_name)
 
     # 10) Produtos
     gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "sku", "tamanho", "cor"]
@@ -359,7 +345,7 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         termo = re.sub(r"\b(tem|de|o|a|um|uma|preço|valor|do|da|no|na|sku|tamanho|cor|disponível|estoque)\b", "", txt, flags=re.I).strip() or txt
         return tool_ver_produto(termo, nome=customer_name)
 
-    return None  # deixa Q&A/RAG tentar
+    return None
 
 # ===== Q&A =====
 def answer_qna(q: str):
