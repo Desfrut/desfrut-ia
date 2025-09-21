@@ -406,7 +406,7 @@ def answer_qna(q: str):
         if not r or not r.get("documents") or not r["documents"][0]: return None
         doc  = r["documents"][0][0]
         dist = r["distances"][0][0]
-        if dist <= 0.35:
+        if dist <= 0.50:
             return doc.split("RESPOSTA:\n",1)[-1].strip() if "RESPOSTA:" in doc else doc.strip()
         return None
     except Exception:
