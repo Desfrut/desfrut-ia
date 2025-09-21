@@ -350,6 +350,12 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         save(cep=cep, intent="frete", next_step="bairro")
         return tool_cotar_frete(cep, nome=customer_name)
 
+     # 4.5) Bairro "sozinho" (quando pediu bairro antes)
+    if (st.get("next_step") == "bairro" or st.get("intent") == "frete") and looks_like_bairro(txt):
+        bairro_txt = txt.strip()
+        save(intent="frete", bairro=bairro_txt, next_step="acionar")
+        return _mc("entrega_bairro_follow", bairro=bairro_txt)
+
     # 5) Bairro explícito
     if EXPLICIT_BAIRRO_RE.search(txt):
         bairro_txt = re.sub(r"^(sou do|sou da|sou de|moro (em|na|no)|estou (em|na|no)|bairro|do bairro|da|de)\s+", "", txt, flags=re.I).strip()
