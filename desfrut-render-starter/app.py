@@ -1,9 +1,8 @@
-# app.py — Desfrut IA v4.4
+# app.py — Desfrut IA v4.4 (limpo)
 # • Fluxo estável: bairro → acionar → checkout
 # • Não finaliza sem item (pede produto)
-# • Entende "pix, entrega" de uma vez
-# • "quanto tempo?" usa o último bairro
-# • Q&A + RAG + /admin/train + /admin/qna_count + /admin/version
+# • Q&A + /admin/train + /admin/qna_count + /admin/version
+# • Sem “trechos de canvas”; ESTE arquivo é autossuficiente.
 
 from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib, random
@@ -13,8 +12,8 @@ from datetime import datetime
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEN_MODEL      = os.getenv("GEN_MODEL", "gpt-4o-mini")
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-CHROMA_DIR     = os.getenv("CHROMA_DIR", "/tmp/chroma")
-STATE_DB       = os.getenv("STATE_DB", "/data/state.json")  # use /data (disk) no Render
+CHROMA_DIR     = os.getenv("CHROMA_DIR", "/data/chroma")
+STATE_DB       = os.getenv("STATE_DB", "/data/state.json")  # use /data no Render
 PRODUTOS_CSV   = os.getenv("PRODUTOS_CSV", "base_produtos.csv")
 ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "")
 HUMAN_WHATS    = os.getenv("HUMAN_WHATS", "📲 (92) 9 9999-9999")
@@ -151,9 +150,11 @@ def buscar_produto(termo: str, n=3):
     if not PROD_CACHE:
         return []
     termo = (termo or "").strip()
+    # SKU
     for p in PROD_CACHE:
         if termo.lower() in str(p.get("sku","")).lower():
             return [p]
+    # Fuzzy por nome
     nomes = [p.get('nome') or p.get('título') or p.get('titulo') or '' for p in PROD_CACHE]
     match = difflib.get_close_matches(termo, nomes, n=n, cutoff=0.5)
     res = [p for p in PROD_CACHE if (p.get('nome') or p.get('título') or p.get('titulo') or '') in match]
@@ -285,7 +286,7 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         # Primeiro: garantir item
         if not st.get("carrinho"):
             p, msg = add_item_from_text(st, txt)
-            save()  # salva carrinho se adicionou
+            save()
             if p:
                 pass
             else:
@@ -324,7 +325,7 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         if st.get("modal") == "Entrega" and not st.get("endereco"):
             return humanize(random.choice(MICROCOPY["address_pedido"]), customer_name)
 
-    # 2) Confirma acionar motoboy → entra em checkout (mas pedirá item)
+    # 2) Confirma acionar motoboy → entra em checkout (pedirá item)
     if st.get("next_step") == "acionar" and (CONFIRM_YES_RE.search(txt) or FINALIZE_RE.search(txt)):
         save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
         p, msg = add_item_from_text(st, txt)
@@ -333,7 +334,7 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
             return tool_criar_pedido(st, customer_name)
         return humanize(_mc("pedir_produto"), customer_name)
 
-    # 3) Pedido explícito para finalizar a qualquer momento
+    # 3) Pedido explícito para finalizar
     if FINALIZE_RE.search(txt):
         save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
         p, msg = add_item_from_text(st, txt)
@@ -406,7 +407,7 @@ def answer_qna(q: str):
         if not r or not r.get("documents") or not r["documents"][0]: return None
         doc  = r["documents"][0][0]
         dist = r["distances"][0][0]
-        if dist <= 0.50:
+        if dist <= 0.50:  # tolerante a typos
             return doc.split("RESPOSTA:\n",1)[-1].strip() if "RESPOSTA:" in doc else doc.strip()
         return None
     except Exception:
