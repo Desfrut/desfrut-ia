@@ -227,9 +227,22 @@ STOPWORDS_SHORT = {"ola","olá","oi","sim","ok","blz","tá","ta","beleza","boa",
 
 def looks_like_bairro(txt: str) -> bool:
     t = (txt or "").strip().lower()
-    if not (1 <= len(t) <= 40): return False
-    if t in STOPWORDS_SHORT: return False
-    if any(p.search(txt) for p in [ENTREGA_RE, TAXA_RE, HUMANO_RE, FINALIZE_RE, PAYMENT_RE, RETIRADA_RE]):
+    if not (1 <= len(t) <= 30): 
+        return False
+    # sem pontuação e sem números
+    if re.search(r"[^a-zà-ú\s]", t): 
+        return False
+    # 1 a 3 palavras
+    if len(t.split()) > 3: 
+        return False
+    # não pode ser stopword
+    if t in STOPWORDS_SHORT: 
+        return False
+    # não conter verbos/perguntas típicas
+    if re.search(r"\b(quero|saber|saiu|tem|faz|fazer|pode|quando|onde|prazo|status)\b", t):
+        return False
+    # não colisão com intenções fortes
+    if any(p.search(txt) for p in [ENTREGA_RE, TAXA_RE, HUMANO_RE, FINALIZE_RE, PAYMENT_RE, RETIRADA_RE, STATUS_RE, GREETING_RE, RESET_RE]):
         return False
     return True
 
@@ -275,7 +288,153 @@ def tempo_estimada(st):
 
 def agente_responder(user_text: str, customer_id: str | None, customer_name: str | None):
     txt = (user_text or "").strip()
-    if not txt: return None
+    if not txt:
+        return None
+
+    st_key = customer_id or "anon"
+    db = _load_state()
+    st = _st(db, st_key)
+
+    def save(**kw):
+        st.update({k:v for k,v in kw.items() if v is not None})
+        db[st_key] = st
+        _save_state(db)
+
+    # 0) reset explícito
+    if RESET_RE.search(txt):
+        db[st_key] = {"carrinho": [], "intent": None, "next_step": None, "stage": None}
+        _save_state(db)
+        return "Zerei aqui 👌 Podemos recomeçar: quer saber de **entrega** (me diga o bairro ou CEP) ou **produto/preço** (me diga o nome ou SKU)?"
+
+    # 1) handoff humano
+    if HUMANO_RE.search(txt):
+        save(intent="humano", next_step=None)
+        return _mc("handoff_humano")
+
+    # 2) status do pedido (sempre responde sem bagunçar carrinho)
+    if STATUS_RE.search(txt):
+        pid = st.get("pedido_id") or "(ainda não criei o número)"
+        when = tempo_estimada(st) or "Em geral entregamos em 45–90 min após fechar o pedido (10h–22h)."
+        itens = _itens_txt(st)
+        return humanize(f"Seu pedido **{pid}** está em andamento. Itens: **{itens}**. {when}", customer_name)
+
+    # 3) checkout (não forçar adicionar item para saudações/perguntas genéricas)
+    if st.get("intent") == "checkout":
+        # saudações → só guia o fluxo
+        if GREETING_RE.search(txt):
+            return humanize("Perfeito! Se já escolheu, me diga o **produto (nome ou SKU)**. Prefere **Pix**, **dinheiro** ou **cartão**? Será **entrega** ou **retirada**?", customer_name)
+        # escolha de pagamento
+        if PAYMENT_RE.search(txt):
+            pag = "Pix" if re.search(r"pix", txt, re.I) else ("Dinheiro" if re.search(r"dinheiro", txt, re.I) else "Cartão (débito/crédito até 6x)")
+            save(pag=pag)
+        # entrega/retirada
+        if RETIRADA_RE.search(txt):
+            save(modal="Retirada")
+        elif ENTREGA_CHOICE_RE.search(txt):
+            save(modal="Entrega")
+        # endereço
+        if ADDRESS_HINT_RE.search(txt) and len(txt) > 8:
+            save(endereco=txt, modal=st.get("modal") or "Entrega")
+
+        # só tenta extrair item se o texto **parece produto** (tem gatilho)
+        if not st.get("carrinho"):
+            gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "sku", "tamanho", "cor", "lubrificante", "kmed", "bullet", "vibrador"]
+            if any(g in txt.lower() for g in gatilhos):
+                p, msg = add_item_from_text(st, txt)
+                save()
+                if not p:
+                    return humanize(msg, customer_name)
+
+        # finalizar se completo
+        if st.get("modal") == "Retirada" and st.get("pag"):
+            return tool_finalizar_pedido(st, customer_name)
+        if st.get("modal") == "Entrega" and st.get("pag") and st.get("endereco"):
+            return tool_finalizar_pedido(st, customer_name)
+
+        # faltantes
+        if not st.get("carrinho"):
+            return humanize(_mc("pedir_produto"), customer_name)
+        if not st.get("pag"):
+            return humanize(random.choice(MICROCOPY["ask_payment"]), customer_name)
+        if not st.get("modal"):
+            return humanize(random.choice(MICROCOPY["ask_delivery"]), customer_name)
+        if st.get("modal") == "Entrega" and not st.get("endereco"):
+            return humanize(random.choice(MICROCOPY["address_pedido"]), customer_name)
+
+    # 4) confirmação para acionar motoboy → entra em checkout
+    if st.get("next_step") == "acionar" and (CONFIRM_YES_RE.search(txt) or FINALIZE_RE.search(txt)):
+        save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
+        # só tenta inferir item se texto tem cara de produto
+        gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "sku", "tamanho", "cor", "lubrificante", "kmed", "bullet", "vibrador"]
+        if any(g in txt.lower() for g in gatilhos):
+            p, msg = add_item_from_text(st, txt)
+            save()
+            if p:
+                return tool_criar_pedido(st, customer_name)
+        return humanize(_mc("pedir_produto"), customer_name)
+
+    # 5) finalizar direto
+    if FINALIZE_RE.search(txt):
+        save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
+        return humanize(_mc("pedir_produto"), customer_name)
+
+    # 6) CEP
+    m = CEP_RE.search(txt)
+    if m:
+        cep = m.group(0)
+        save(cep=cep, intent="frete", next_step="bairro")
+        return tool_cotar_frete(cep, nome=customer_name)
+
+    # 6.5) bairro “curto” (solto) somente se estava pedindo bairro
+    if (st.get("next_step") == "bairro" or st.get("intent") == "frete") and looks_like_bairro(txt):
+        bairro_txt = txt.strip()
+        save(intent="frete", bairro=bairro_txt, next_step="acionar")
+        return _mc("entrega_bairro_follow", bairro=bairro_txt)
+
+    # 7) bairro explícito
+    if EXPLICIT_BAIRRO_RE.search(txt):
+        bairro_txt = re.sub(r"^(sou do|sou da|sou de|moro (em|na|no)|estou (em|na|no)|bairro|do bairro|da|de)\s+", "", txt, flags=re.I).strip()
+        if looks_like_bairro(bairro_txt):
+            save(intent="frete", bairro=bairro_txt, next_step="acionar")
+            return _mc("entrega_bairro_follow", bairro=bairro_txt)
+
+    # 8) “já informei / mesmo bairro”
+    if BAIRRO_CONFIRM_RE.search(txt):
+        if st.get("bairro"):
+            save(next_step="acionar")
+            return _mc("entrega_bairro_follow", bairro=st["bairro"])
+        save(intent="frete", next_step="bairro")
+        return humanize("Consegue me dizer o bairro, por favor? Assim eu te passo a janela certinha.", customer_name)
+
+    # 9) intenção entrega/frete genérica
+    if ENTREGA_RE.search(txt):
+        save(intent="frete")
+        if st.get("bairro"):
+            save(next_step="acionar")
+            return _mc("entrega_bairro_follow", bairro=st["bairro"])
+        save(next_step="bairro")
+        return _mc("entrega_manaus_sem_cep", nome=customer_name)
+
+    # 10) taxa
+    if TAXA_RE.search(txt):
+        if st.get("bairro"):
+            return humanize("Dentro de Manaus a entrega é **grátis** em horário comercial. Posso acionar o motoboy?", customer_name)
+        return humanize("Em Manaus a entrega é grátis; para outras cidades, o valor depende do CEP (PAC/Sedex). Me manda o CEP que eu calculo já.", customer_name)
+
+    # 11) tempo
+    if TEMPO_RE.search(txt):
+        t = tempo_estimada(st)
+        if t: return humanize(t, customer_name)
+        return humanize("Me diz o bairro e eu te passo a janela certinha 👍", customer_name)
+
+    # 12) produtos fora do checkout: só se texto tem cara de produto
+    gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "sku", "tamanho", "cor", "lubrificante", "kmed", "bullet", "vibrador"]
+    if any(g in txt.lower() for g in gatilhos):
+        p, msg = add_item_from_text(st, txt)
+        save()
+        return humanize(msg, customer_name)
+
+    return None
 
     st_key = customer_id or "anon"
     db = _load_state()
