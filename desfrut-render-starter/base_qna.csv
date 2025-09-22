@@ -1,16 +1,6 @@
 pergunta,resposta,tags
-formas de pagamento,"Aceitamos Pix, dinheiro e cartão (débito/crédito até 6x). No Whats mando o QR Pix ou levamos a maquininha na entrega.",pagamento
-comprovante pix,"Assim que você confirma, envio o QR Pix. Pagou? Me manda o comprovante aqui para eu liberar o pedido.",pagamento
+formas de pagamento,"Aceitamos Pix, dinheiro e cartão (débito/crédito até 6x). No Whats mando o QR Pix ou levo a maquininha na entrega.",pagamento
 embalagem discreta,"Sempre embalamos de forma discreta, sem identificar o conteúdo. A nota fiscal também não descreve o item.",privacidade
-privacidade de dados,"Seus dados ficam seguros e usamos apenas para entrega e comunicação do pedido.",privacidade
-troca e garantia,"Produtos com defeito de fabricação têm suporte. Fale comigo aqui e resolvemos direitinho conforme o código do consumidor.",pos-venda
-higienização de toys,"Lave antes e depois do uso com água e sabonete neutro. Seque bem. Para materiais porosos, prefira usar preservativo.",higiene
-lubrificante recomendado,"Prefira lubrificante à base de água (compatível com silicone e com preservativo).",higiene
-materiais,"Silicone médico é hipoalergênico e macio; ABS é rígido; TPE é macio mas poroso. Se tiver alergia, vá de silicone médico.",materiais
-como escolher primeiro toy,"Comece com algo discreto e fácil de usar, como um bullet vibrador. Se quiser, te indico opções por faixa de preço.",consultivo
-bateria e carregamento,"Muitos vibradores são recarregáveis via USB. Evite carregar próximo à água e siga o tempo indicado pelo fabricante.",uso
-barulho do produto,"Modelos mais modernos são silenciosos. Se isso for importante pra você, eu priorizo os de menor ruído na sugestão.",consultivo
-kit presente,"Faço kits prontos com 2–3 itens (toy + gel + massagem). Posso montar por faixa de preço que preferir.",consultivo
+higienização,"Lave antes e depois do uso com água e sabonete neutro. Seque bem. Para materiais porosos, prefira usar preservativo.",higiene
+materiais,"Silicone médico é hipoalergênico e macio; ABS é rígido; TPE é macio porém poroso. Se houver alergia, prefira silicone médico.",materiais
 horário de atendimento,"Atendo de 10h às 22h (Manaus). Se mandar fora do horário, respondo assim que iniciarmos o expediente.",atendimento
-falar com humano,"Te conecto com uma especialista ❤️  Contato: %%WHATS%% — atendimento %%HORARIO%%.",humano
-boleto ou transferência,"No momento trabalhamos com Pix, dinheiro e cartão. Se precisar de alternativa, me fala que vemos o melhor pra você.",pagamento
