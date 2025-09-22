@@ -1,8 +1,9 @@
-# app.py — Desfrut IA v4.4 (limpo)
-# • Fluxo estável: bairro → acionar → checkout
-# • Não finaliza sem item (pede produto)
-# • Q&A + /admin/train + /admin/qna_count + /admin/version
-# • Sem “trechos de canvas”; ESTE arquivo é autossuficiente.
+# app.py — Desfrut IA v4.5 (estável)
+# • Fluxo bairro → acionar → checkout (não finaliza sem item)
+# • Q&A: lexical (CSV) -> embeddings (Chroma)  — tolerante a typos
+# • Catálogo: sinônimos + fuzzy relaxado
+# • Admin: /admin/train /admin/qna_count /admin/version /admin/debug /admin/prod_count
+# • Patch "bairro sozinho" incluso
 
 from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib, random
@@ -19,7 +20,7 @@ ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "")
 HUMAN_WHATS    = os.getenv("HUMAN_WHATS", "📲 (92) 9 9999-9999")
 HUMAN_HORARIO  = os.getenv("HUMAN_HORARIO", "10h às 22h (Manaus)")
 LOJA_ENDERECO  = os.getenv("LOJA_ENDERECO", "Rua Exemplo, 123 — Manaus")
-AGENT_VERSION  = "4.4"
+AGENT_VERSION  = "4.5"
 
 app = Flask(__name__)
 
@@ -132,7 +133,14 @@ def _embed(text: str):
     except Exception:
         return None
 
-# ===== Produtos =====
+# ===== Produtos (sinônimos + fuzzy relaxado) =====
+SINONIMOS = {
+    "bullet": ["bullet", "vibrador bullet"],
+    "vibrador": ["vibrador", "personal", "vibe", "vibrador personal"],
+    "kmed": ["k-med", "kmed", "gel k-med", "gel kmed", "k med"],
+    "lubrificante": ["lubrificante", "gel íntimo", "gel intimo"]
+}
+
 def _carregar_produtos():
     itens = []
     try:
@@ -142,22 +150,47 @@ def _carregar_produtos():
     except Exception:
         pass
     return itens
+
 PROD_CACHE = None
+
 def buscar_produto(termo: str, n=3):
     global PROD_CACHE
     if PROD_CACHE is None:
         PROD_CACHE = _carregar_produtos()
     if not PROD_CACHE:
         return []
-    termo = (termo or "").strip()
-    # SKU
+    termo = (termo or "").strip().lower()
+
+    # 0) expandir sinônimos
+    cand_termos = [termo]
+    for k, alts in SINONIMOS.items():
+        if k in termo:
+            cand_termos.extend(alts)
+    cand_termos = list(dict.fromkeys(cand_termos))  # únicos
+
+    # 1) SKU (substring)
     for p in PROD_CACHE:
-        if termo.lower() in str(p.get("sku","")).lower():
+        sku = str(p.get("sku","")).lower()
+        if any(ct in sku for ct in cand_termos if len(ct) >= 3):
             return [p]
-    # Fuzzy por nome
-    nomes = [p.get('nome') or p.get('título') or p.get('titulo') or '' for p in PROD_CACHE]
-    match = difflib.get_close_matches(termo, nomes, n=n, cutoff=0.5)
-    res = [p for p in PROD_CACHE if (p.get('nome') or p.get('título') or p.get('titulo') or '') in match]
+
+    # 2) Fuzzy por nome (cutoff 0.4)
+    nomes = [ (p.get('nome') or p.get('título') or p.get('titulo') or '').lower() for p in PROD_CACHE ]
+    melhores = set()
+    for ct in cand_termos:
+        if not ct: continue
+        matches = difflib.get_close_matches(ct, nomes, n=n, cutoff=0.4)
+        melhores.update(matches)
+    res = [p for p in PROD_CACHE if (p.get('nome') or p.get('título') or p.get('titulo') or '').lower() in melhores]
+
+    # 3) fallback por palavra-chave (bullet/vibrador/kmed/lubrificante)
+    if not res and any(x in termo for x in ["bullet","vibrador","kmed","k-med","lubrificante","gel"]):
+        for p in PROD_CACHE:
+            nomep = (p.get('nome') or p.get('título') or p.get('titulo') or '').lower()
+            if any(x in nomep for x in ["bullet","vibrador","k-med","kmed","lubrificante","gel"]):
+                res.append(p)
+                if len(res) >= n: break
+
     return res[:n]
 
 def add_item_from_text(st, txt):
@@ -240,7 +273,6 @@ def _itens_txt(st):
     return ", ".join([f'{i.get("nome","Item")} (SKU {i.get("sku","—")})' for i in itens])
 
 def tool_finalizar_pedido(st, nome=None):
-    # Não finaliza se não houver item
     if not st.get("carrinho"):
         return _mc("pedir_produto")
     pedido_id = st.get("pedido_id") or _novo_pedido_id(st)
@@ -283,16 +315,12 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
 
     # 1) CHECKOUT tem prioridade
     if st.get("intent") == "checkout":
-        # Primeiro: garantir item
         if not st.get("carrinho"):
             p, msg = add_item_from_text(st, txt)
             save()
-            if p:
-                pass
-            else:
+            if not p:
                 return humanize(msg, customer_name)
 
-        # Pagamento/modal/endereço
         pag = None
         if PAYMENT_RE.search(txt):
             pag = "Pix" if re.search(r"pix", txt, re.I) else \
@@ -307,13 +335,11 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         if ADDRESS_HINT_RE.search(txt) and len(txt) > 8:
             save(endereco=txt, modal=st.get("modal") or "Entrega")
 
-        # Finaliza se tiver tudo
         if st.get("modal") == "Retirada" and st.get("pag"):
             return tool_finalizar_pedido(st, customer_name)
         if st.get("modal") == "Entrega" and st.get("pag") and st.get("endereco"):
             return tool_finalizar_pedido(st, customer_name)
 
-        # pedir o que falta
         if not st.get("pag") and not st.get("modal"):
             return humanize("Perfeito! Me diga **produto (nome ou SKU)** — se já escolheu. E prefere **Pix**, **dinheiro** ou **cartão**? Será **entrega** ou **retirada**?", customer_name)
         if not st.get("carrinho"):
@@ -325,7 +351,7 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         if st.get("modal") == "Entrega" and not st.get("endereco"):
             return humanize(random.choice(MICROCOPY["address_pedido"]), customer_name)
 
-    # 2) Confirma acionar motoboy → entra em checkout (pedirá item)
+    # 2) Confirma acionar motoboy → entra em checkout
     if st.get("next_step") == "acionar" and (CONFIRM_YES_RE.search(txt) or FINALIZE_RE.search(txt)):
         save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
         p, msg = add_item_from_text(st, txt)
@@ -350,13 +376,13 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         save(cep=cep, intent="frete", next_step="bairro")
         return tool_cotar_frete(cep, nome=customer_name)
 
-     # 4.5) Bairro "sozinho" (quando pediu bairro antes)
+    # 4.5) Bairros “soltos”
     if (st.get("next_step") == "bairro" or st.get("intent") == "frete") and looks_like_bairro(txt):
         bairro_txt = txt.strip()
         save(intent="frete", bairro=bairro_txt, next_step="acionar")
         return _mc("entrega_bairro_follow", bairro=bairro_txt)
 
-    # 5) Bairro explícito
+    # 5) Bairro explícito (“estou no…”, “bairro…”)
     if EXPLICIT_BAIRRO_RE.search(txt):
         bairro_txt = re.sub(r"^(sou do|sou da|sou de|moro (em|na|no)|estou (em|na|no)|bairro|do bairro|da|de)\s+", "", txt, flags=re.I).strip()
         save(intent="frete", bairro=bairro_txt, next_step="acionar")
@@ -391,8 +417,8 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         if t: return humanize(t, customer_name)
         return humanize("Me diz o bairro e eu te passo a janela certinha 👍", customer_name)
 
-    # 10) Produtos (fora do checkout): listar/sugerir
-    gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "sku", "tamanho", "cor"]
+    # 10) Produtos (fora do checkout)
+    gatilhos = ["tem ", "estoque", "disponível", "preço", "valor", "sku", "tamanho", "cor", "lubrificante", "kmed", "bullet", "vibrador"]
     if any(g in txt.lower() for g in gatilhos):
         p, msg = add_item_from_text(st, txt)
         save()
@@ -400,7 +426,40 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
 
     return None
 
-# ===== Q&A =====
+# ===== Q&A Lexical (direto do CSV, tolerante a typos) =====
+QNA_CACHE = None
+def _load_qna_csv():
+    global QNA_CACHE
+    if QNA_CACHE is not None: return QNA_CACHE
+    QNA_CACHE = []
+    try:
+        with open("base_qna.csv", newline='', encoding='utf-8') as f:
+            for r in csv.DictReader(f):
+                per = (r.get("pergunta") or "").strip()
+                res = (r.get("resposta") or "").strip()
+                if per and res:
+                    QNA_CACHE.append((per, res))
+    except Exception:
+        pass
+    return QNA_CACHE
+
+def answer_qna_lexical(q: str):
+    rows = _load_qna_csv()
+    if not rows: return None
+    qlow = q.lower()
+    # 1) contém
+    for per,res in rows:
+        if per.lower() in qlow or qlow in per.lower():
+            return res
+    # 2) fuzzy (cutoff 0.6)
+    perguntas = [per for per,_ in rows]
+    match = difflib.get_close_matches(q, perguntas, n=1, cutoff=0.6)
+    if match:
+        for per,res in rows:
+            if per == match[0]: return res
+    return None
+
+# ===== Q&A por embeddings (Chroma) =====
 def answer_qna(q: str):
     try:
         import chromadb
@@ -413,7 +472,7 @@ def answer_qna(q: str):
         if not r or not r.get("documents") or not r["documents"][0]: return None
         doc  = r["documents"][0][0]
         dist = r["distances"][0][0]
-        if dist <= 0.50:  # tolerante a typos
+        if dist <= 0.50:  # tolerante
             return doc.split("RESPOSTA:\n",1)[-1].strip() if "RESPOSTA:" in doc else doc.strip()
         return None
     except Exception:
@@ -483,6 +542,8 @@ def version():
     return jsonify(ok=True, version=AGENT_VERSION)
 
 def _respond(question, cust_id=None, cust_name=None):
+    a = answer_qna_lexical(question)
+    if a: return humanize(a, cust_name)
     a = answer_qna(question)
     if a: return humanize(a, cust_name)
     a = agente_responder(question, cust_id, cust_name)
@@ -566,7 +627,8 @@ def admin_qna_count():
         return jsonify(ok=True, count=c)
     except Exception as e:
         return jsonify(ok=False, error=str(e))
-# ===== DIAGNÓSTICOS RÁPIDOS =====
+
+# ===== DIAGNÓSTICOS =====
 @app.get("/admin/prod_count")
 def admin_prod_count():
     token = request.args.get("token","")
@@ -598,8 +660,7 @@ def admin_debug():
             res = col.get(ids=None, include=[])
             qna_count = len(res.get("ids", []))
     except Exception:
-        qna_count = -1  # erro
-
+        qna_count = -1
     # Produtos
     prod = []
     global PROD_CACHE
@@ -608,21 +669,13 @@ def admin_debug():
     prod_count = len(PROD_CACHE or [])
     for p in (PROD_CACHE or [])[:3]:
         prod.append(p.get("nome") or p.get("título") or p.get("titulo") or "")
-
     return jsonify(
         ok=True,
         version=AGENT_VERSION,
         oai_ok=bool(OPENAI_API_KEY) and (oai is not None),
-        env={
-            "TZ": os.getenv("TZ",""),
-            "STATE_DB": STATE_DB,
-            "CHROMA_DIR": CHROMA_DIR,
-            "PRODUTOS_CSV": PRODUTOS_CSV
-        },
-        qna_count=qna_count,
-        prod_count=prod_count,
-        prod_sample=prod,
-        prod_file_exists=os.path.exists(PRODUTOS_CSV)
+        env={"TZ": os.getenv("TZ",""), "STATE_DB": STATE_DB, "CHROMA_DIR": CHROMA_DIR, "PRODUTOS_CSV": PRODUTOS_CSV},
+        qna_count=qna_count, prod_count=prod_count, prod_sample=prod, prod_file_exists=os.path.exists(PRODUTOS_CSV)
     )
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","10000")), debug=False)
