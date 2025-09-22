@@ -1,15 +1,9 @@
-# app.py — Desfrut IA v4.6 (SAFE MODE, sem OpenAI/Chroma)
-# - Q&A direto do CSV (fuzzy)
-# - Catálogo via CSV (sinônimos + fuzzy)
-# - Agente de entrega/checkout estável (com GREETING/STATUS/RESET)
-# - /ask resiliente, /admin/debug e /admin/prod_count
-# - Sem “Fontes”, sem dependências externas
-
+# app.py — Desfrut IA v4.6-safe (único/definitivo)
 from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib, random
 from datetime import datetime
 
-# ===== Config/env =====
+# ===== Config =====
 STATE_DB       = os.getenv("STATE_DB", "/data/state.json")
 PRODUTOS_CSV   = os.getenv("PRODUTOS_CSV", "base_produtos.csv")
 ADMIN_TOKEN    = os.getenv("ADMIN_TOKEN", "desfrut123")
@@ -20,7 +14,6 @@ AGENT_VERSION  = "4.6-safe"
 
 app = Flask(__name__)
 
-# ==== Horário/saudação (sem pytz) ====
 def _saudacao():
     h = datetime.now().hour
     if 5 <= h < 12:  return "Bom dia"
@@ -28,58 +21,30 @@ def _saudacao():
     return "Boa noite"
 
 def humanize(texto: str, nome: str | None = None) -> str:
-    primeiros = (texto or "")[:20].lower()
-    if any(primeiros.startswith(x) for x in ["oi", "olá", "ola", "bom ", "boa "]):
-        return texto
-    pref = _saudacao()
-    if nome:
-        return f"{pref}, {nome.split(' ')[0]}! {texto}"
-    return f"{pref}! {texto}"
+    texto = (texto or "").strip()
+    if not texto: return "Posso te ajudar com mais alguma coisa?"
+    primeiros = texto[:20].lower()
+    if any(primeiros.startswith(x) for x in ["oi","olá","ola","bom ","boa "]):
+        pref = ""
+    else:
+        pref = _saudacao() + (f", {nome.split(' ')[0]}" if nome else "") + "! "
+    return (pref + texto).strip()
 
-# ===== Microcopy =====
 MICROCOPY = {
-    "entrega_manaus_sem_cep": [
-        "%%SAUD%%, %%NOME%%! Entregamos em Manaus no mesmo dia (10h–22h). Qual é o bairro? Assim estimo a janela certinha."
-    ],
-    "entrega_cep_manaus": [
-        "Perfeito! CEP de Manaus identificado. A entrega é no mesmo dia (10h–22h). Qual o bairro para estimar a janela?"
-    ],
-    "entrega_cep_brasil": [
-        "Para este CEP, envio por Correios (PAC/Sedex). Prefere rapidez (Sedex) ou economia (PAC)?"
-    ],
-    "entrega_bairro_follow": [
-        "Bairro **%%BAIRRO%%**: normalmente 45–90 min após o fechamento (10h–22h). Quer que eu acione o motoboy?"
-    ],
-    "produto_lista": [
-        "Separei opções:\n%%LINHAS%%\nQual você quer? Pode me mandar o **SKU**."
-    ],
-    "pedir_produto": [
-        "Perfeito! Qual **produto** você deseja? Me diga o **nome** ou **SKU** que eu já separo."
-    ],
-    "pedido_criado": [
-        "Pedido rascunho **%%ID%%** criado. Você prefere **Pix**, **dinheiro** ou **cartão** (débito/crédito até 6x)? É **entrega** ou **retirada**?"
-    ],
-    "pedido_resumo_final": [
-        "Fechado! Pedido **%%ID%%**:\n• Itens: **%%ITENS%%**\n• Pagamento: **%%PAG%%**\n• Modalidade: **%%MODAL%%**\n%%ENDERECO%%\nJá vou separar e te atualizo o horário 👌"
-    ],
-    "handoff_humano": [
-        "Sem problema! Te conecto com uma especialista ❤️  Contato: %%WHATS%% — atendimento %%HORARIO%%."
-    ],
-    "address_pedido": [
-        "Me envia o **endereço completo** (rua, número e ponto de referência)."
-    ],
-    "ask_delivery": [
-        "Vai querer **entrega** ou **retirada**?"
-    ],
-    "ask_payment": [
-        "Quer pagar por **Pix**, **dinheiro** ou **cartão** (débito/crédito até 6x)?"
-    ],
-    "fallback": [
-        "Posso te ajudar com frete (me mande o CEP) ou disponibilidade/preço (me diga o nome/SKU)."
-    ],
-    "tempo_bairro": [
-        "Para **%%BAIRRO%%**, a janela costuma ser de **45–90 min** após fecharmos o pedido (10h–22h)."
-    ]
+    "entrega_manaus_sem_cep": ["%%SAUD%%, %%NOME%%! Entregamos em Manaus no mesmo dia (10h–22h). Qual é o bairro? Assim estimo a janela certinha."],
+    "entrega_cep_manaus": ["Perfeito! CEP de Manaus identificado. A entrega é no mesmo dia (10h–22h). Qual o bairro para estimar a janela?"],
+    "entrega_cep_brasil": ["Para este CEP, envio por Correios (PAC/Sedex). Prefere rapidez (Sedex) ou economia (PAC)?"],
+    "entrega_bairro_follow": ["Bairro **%%BAIRRO%%**: normalmente 45–90 min após o fechamento (10h–22h). Quer que eu acione o motoboy?"],
+    "produto_lista": ["Separei opções:\n%%LINHAS%%\nQual você quer? Pode me mandar o **SKU**."],
+    "pedir_produto": ["Perfeito! Qual **produto** você deseja? Me diga o **nome** ou **SKU** que eu já separo."],
+    "pedido_criado": ["Pedido rascunho **%%ID%%** criado. Você prefere **Pix**, **dinheiro** ou **cartão** (débito/crédito até 6x)? É **entrega** ou **retirada**?"],
+    "pedido_resumo_final": ["Fechado! Pedido **%%ID%%**:\n• Itens: **%%ITENS%%**\n• Pagamento: **%%PAG%%**\n• Modalidade: **%%MODAL%%**\n%%ENDERECO%%\nJá vou separar e te atualizo o horário 👌"],
+    "handoff_humano": ["Sem problema! Te conecto com uma especialista ❤️  Contato: %%WHATS%% — atendimento %%HORARIO%%."],
+    "address_pedido": ["Me envia o **endereço completo** (rua, número e ponto de referência)."],
+    "ask_delivery": ["Vai querer **entrega** ou **retirada**?"],
+    "ask_payment": ["Quer pagar por **Pix**, **dinheiro** ou **cartão** (débito/crédito até 6x)?"],
+    "fallback": ["Posso te ajudar com frete (me mande o CEP) ou disponibilidade/preço (me diga o nome/SKU)."],
+    "tempo_bairro": ["Para **%%BAIRRO%%**, a janela costuma ser de **45–90 min** após fecharmos o pedido (10h–22h)."]
 }
 
 def _mc(key, **kws):
@@ -99,7 +64,6 @@ def _mc(key, **kws):
     for k,v in repl.items(): t = t.replace(k, v)
     return t
 
-# ===== Estado em disco =====
 def _load_state():
     try:
         with open(STATE_DB, 'r', encoding='utf-8') as f:
@@ -115,7 +79,7 @@ def _save_state(d):
 def _st(db, key):
     return db.get(key, {"carrinho": [], "intent": None, "next_step": None, "stage": None})
 
-# ===== Regex de intenções =====
+# ===== Regex =====
 CEP_RE      = re.compile(r"\b\d{5}-?\d{3}\b")
 ENTREGA_RE  = re.compile(r"\b(entrega|entregam|entregas|frete|enviar|envia|delivery|motoboy|retirada|retira|buscar)\b", re.I)
 TAXA_RE     = re.compile(r"\b(taxa|taxas|cobra|cobram|cobrar|cobrança|custa|valor da entrega|taxa de entrega)\b", re.I)
@@ -123,7 +87,7 @@ HUMANO_RE   = re.compile(r"\b(humano|atendente|vendedor(a)?|pessoa|falar com hum
 BAIRRO_CONFIRM_RE = re.compile(r"\b(informei (acima|antes)|ja? informei|mesmo bairro|o mesmo|como disse)\b", re.I)
 FINALIZE_RE = re.compile(r"\b(finaliza(r)?|pode (enviar|acionar|chamar)|segue? (com|a) entrega|pode fechar|vamos fechar|quero (fechar|finalize)|fechar pedido|checkout)\b", re.I)
 CONFIRM_YES_RE = re.compile(r"^(sim|pode|ok|isso|bora|vamos)$", re.I)
-PAYMENT_RE  = re.compile(r"\b(pix|dinheiro|d(é|e)b(í|i)to|cr(é|e)dito|cart(ã|a)o|6x|6 parcelas|parcelar)\b", re.I)
+PAYMENT_RE  = re.compile(r"\b(pix|dinheiro|d(é|e)b(í|i)to|cr(é|e)dito|cart(ã|a)o|6x|6 parcelas|parcelar|pagamento)\b", re.I)
 RETIRADA_RE = re.compile(r"\b(retira(da)?|pegar na loja|buscar na loja|retirar na loja)\b", re.I)
 ENTREGA_CHOICE_RE = re.compile(r"\b(entrega|motoboy|enviar)\b", re.I)
 ADDRESS_HINT_RE = re.compile(r"\b(rua|avenida|av\.?|travessa|condom(í|i)nio|residencial|bloco|casa|apto|apartamento|n(º|o)|numero|número)\b", re.I)
@@ -134,17 +98,6 @@ STATUS_RE   = re.compile(r"\b(status|acompanhar|andamento|rastreio|rastreamento|
 RESET_RE    = re.compile(r"\b(cancelar|reset(ar)?|recomeçar|novo pedido|limpar conversa)\b", re.I)
 
 STOPWORDS_SHORT = {"ola","olá","oi","sim","ok","blz","tá","ta","beleza","boa","bom","entrega","entrega hoje"}
-
-def looks_like_bairro(txt: str) -> bool:
-    t = (txt or "").strip().lower()
-    if not (1 <= len(t) <= 30): return False
-    if re.search(r"[^a-zà-ú\s]", t): return False    # só letras/acentos/espaço
-    if len(t.split()) > 3: return False             # no máx. 3 palavras
-    if t in STOPWORDS_SHORT: return False
-    if re.search(r"\b(quero|saber|saiu|tem|faz|fazer|pode|quando|onde|prazo|status)\b", t): return False
-    if any(p.search(txt) for p in [ENTREGA_RE, TAXA_RE, HUMANO_RE, FINALIZE_RE, PAYMENT_RE, RETIRADA_RE, TEMPO_RE, GREETING_RE, STATUS_RE, RESET_RE]):
-        return False
-    return True
 
 # ===== Produtos (CSV + fuzzy + sinônimos) =====
 SINONIMOS = {
@@ -222,38 +175,6 @@ def add_item_from_text(st, txt):
         linhas.append(f"• {nomep} (SKU {sku}) – R$ {preco}")
     return None, _mc("produto_lista", linhas="\n".join(linhas))
 
-# ===== Q&A pelo CSV (sem OpenAI) =====
-QNA_CACHE = None
-def _load_qna_csv():
-    global QNA_CACHE
-    if QNA_CACHE is not None: return QNA_CACHE
-    QNA_CACHE = []
-    try:
-        with open("base_qna.csv", newline='', encoding='utf-8') as f:
-            for r in csv.DictReader(f):
-                per = (r.get("pergunta") or "").strip()
-                res = (r.get("resposta") or "").strip()
-                if per and res:
-                    QNA_CACHE.append((per, res))
-    except Exception:
-        pass
-    return QNA_CACHE
-
-def answer_qna_lexical(q: str):
-    rows = _load_qna_csv()
-    if not rows: return None
-    qlow = q.lower()
-    for per,res in rows:
-        if per.lower() in qlow or qlow in per.lower():
-            return res
-    perguntas = [per for per,_ in rows]
-    match = difflib.get_close_matches(q, perguntas, n=1, cutoff=0.55)
-    if match:
-        for per,res in rows:
-            if per == match[0]: return res
-    return None
-
-# ===== Ferramentas do agente =====
 def tool_cotar_frete(cep: str, nome=None):
     cep = re.sub(r"\D", "", cep)
     if cep.startswith("690"):
@@ -294,6 +215,17 @@ def tempo_estimada(st):
     if not b: return None
     return _mc("tempo_bairro", bairro=b)
 
+def looks_like_bairro(txt: str) -> bool:
+    t = (txt or "").strip().lower()
+    if not (1 <= len(t) <= 30): return False
+    if re.search(r"[^a-zà-ú\s]", t): return False
+    if len(t.split()) > 3: return False
+    if t in STOPWORDS_SHORT: return False
+    if re.search(r"\b(quero|saber|saiu|tem|faz|fazer|pode|quando|onde|prazo|status)\b", t): return False
+    if any(p.search(txt) for p in [ENTREGA_RE, TAXA_RE, HUMANO_RE, FINALIZE_RE, PAYMENT_RE, RETIRADA_RE, TEMPO_RE, GREETING_RE, STATUS_RE, RESET_RE]):
+        return False
+    return True
+
 def agente_responder(user_text: str, customer_id: str | None, customer_name: str | None):
     txt = (user_text or "").strip()
     if not txt: return None
@@ -301,31 +233,26 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
     st_key = customer_id or "anon"
     db = _load_state()
     st = _st(db, st_key)
-
     def save(**kw):
         st.update({k:v for k,v in kw.items() if v is not None})
         db[st_key] = st
         _save_state(db)
 
-    # reset explícito
     if RESET_RE.search(txt):
         db[st_key] = {"carrinho": [], "intent": None, "next_step": None, "stage": None}
         _save_state(db)
         return "Zerei aqui 👌 Podemos recomeçar: quer saber de **entrega** (me diga bairro ou CEP) ou **produto/preço** (me diga o nome ou SKU)?"
 
-    # humano
     if HUMANO_RE.search(txt):
         save(intent="humano", next_step=None)
         return _mc("handoff_humano")
 
-    # status
     if STATUS_RE.search(txt):
         pid = st.get("pedido_id") or "(ainda não criei o número)"
         when = tempo_estimada(st) or "Em geral entregamos em 45–90 min após fechar o pedido (10h–22h)."
         itens = _itens_txt(st)
         return humanize(f"Seu pedido **{pid}** está em andamento. Itens: **{itens}**. {when}", customer_name)
 
-    # checkout
     if st.get("intent") == "checkout":
         if GREETING_RE.search(txt):
             return humanize("Me diga o **produto (nome ou SKU)**. Prefere **Pix**, **dinheiro** ou **cartão**? Será **entrega** ou **retirada**?", customer_name)
@@ -351,37 +278,31 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         if st.get("modal") == "Entrega" and not st.get("endereco"):
             return humanize(random.choice(MICROCOPY["address_pedido"]), customer_name)
 
-    # acionar motoboy → checkout
     if st.get("next_step") == "acionar" and (CONFIRM_YES_RE.search(txt) or FINALIZE_RE.search(txt)):
         save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
         return humanize(_mc("pedir_produto"), customer_name)
 
-    # finalizar direto
     if FINALIZE_RE.search(txt):
         save(intent="checkout", next_step=None, pedido_id=st.get("pedido_id") or _novo_pedido_id(st))
         return humanize(_mc("pedir_produto"), customer_name)
 
-    # CEP
     m = CEP_RE.search(txt)
     if m:
         cep = m.group(0)
         save(cep=cep, intent="frete", next_step="bairro")
         return tool_cotar_frete(cep, nome=customer_name)
 
-    # bairro curto quando foi solicitado
     if (st.get("next_step") == "bairro" or st.get("intent") == "frete") and looks_like_bairro(txt):
         bairro_txt = txt.strip()
         save(intent="frete", bairro=bairro_txt, next_step="acionar")
         return _mc("entrega_bairro_follow", bairro=bairro_txt)
 
-    # bairro explícito
     if EXPLICIT_BAIRRO_RE.search(txt):
         bairro_txt = re.sub(r"^(sou do|sou da|sou de|moro (em|na|no)|estou (em|na|no)|bairro|do bairro|da|de)\s+", "", txt, flags=re.I).strip()
         if looks_like_bairro(bairro_txt):
             save(intent="frete", bairro=bairro_txt, next_step="acionar")
             return _mc("entrega_bairro_follow", bairro=bairro_txt)
 
-    # já informei / mesmo bairro
     if BAIRRO_CONFIRM_RE.search(txt):
         if st.get("bairro"):
             save(next_step="acionar")
@@ -389,7 +310,6 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         save(intent="frete", next_step="bairro")
         return humanize("Consegue me dizer o bairro, por favor? Assim eu te passo a janela certinha.", customer_name)
 
-    # intenção entrega genérica
     if ENTREGA_RE.search(txt):
         save(intent="frete")
         if st.get("bairro"):
@@ -398,19 +318,16 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
         save(next_step="bairro")
         return _mc("entrega_manaus_sem_cep", nome=customer_name)
 
-    # taxa
     if TAXA_RE.search(txt):
         if st.get("bairro"):
             return humanize("Dentro de Manaus a entrega é **grátis** em horário comercial. Posso acionar o motoboy?", customer_name)
         return humanize("Em Manaus a entrega é grátis; para outras cidades, o valor depende do CEP (PAC/Sedex). Me manda o CEP que eu calculo já.", customer_name)
 
-    # tempo
     if TEMPO_RE.search(txt):
         t = tempo_estimada(st)
         if t: return humanize(t, customer_name)
         return humanize("Me diz o bairro e eu te passo a janela certinha 👍", customer_name)
 
-    # produtos fora do checkout (só se parecer produto)
     gat = ["tem ","estoque","disponível","preço","valor","sku","tamanho","cor","lubrificante","kmed","bullet","vibrador"]
     if any(g in txt.lower() for g in gat):
         p, msg = add_item_from_text(st, txt); save()
@@ -418,7 +335,38 @@ def agente_responder(user_text: str, customer_id: str | None, customer_name: str
 
     return None
 
-# ===== Página / /ask =====
+# ===== Q&A CSV (sem OpenAI) =====
+QNA_CACHE = None
+def _load_qna_csv():
+    global QNA_CACHE
+    if QNA_CACHE is not None: return QNA_CACHE
+    QNA_CACHE = []
+    try:
+        with open("base_qna.csv", newline='', encoding='utf-8') as f:
+            for r in csv.DictReader(f):
+                per = (r.get("pergunta") or "").strip()
+                res = (r.get("resposta") or "").strip()
+                if per and res:
+                    QNA_CACHE.append((per, res))
+    except Exception:
+        pass
+    return QNA_CACHE
+
+def answer_qna_lexical(q: str):
+    rows = _load_qna_csv()
+    if not rows: return None
+    qlow = q.lower()
+    for per,res in rows:
+        if per.lower() in qlow or qlow in per.lower():
+            return res
+    perguntas = [per for per,_ in rows]
+    match = difflib.get_close_matches(q, perguntas, n=1, cutoff=0.55)
+    if match:
+        for per,res in rows:
+            if per == match[0]: return res
+    return None
+
+# ===== HTML & Admin =====
 HTML = """
 <!doctype html><html><head><meta charset="utf-8"/><title>Desfrut IA</title>
 <style>body{font-family:Arial;max-width:820px;margin:40px auto;padding:0 16px}
@@ -437,7 +385,6 @@ async function ask(){
 document.getElementById('send').onclick=ask;
 </script></body></html>
 """
-
 @app.get("/")
 def home(): return render_template_string(HTML)
 
@@ -451,19 +398,27 @@ def version():
         return jsonify(ok=False, error="forbidden"), 403
     return jsonify(ok=True, version=AGENT_VERSION)
 
+@app.get("/admin/reset_state")
+def admin_reset():
+    token = request.args.get("token","")
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        return jsonify(ok=False, error="forbidden"), 403
+    try:
+        if os.path.exists(STATE_DB): os.remove(STATE_DB)
+    except Exception: pass
+    return jsonify(ok=True, cleared=True)
+
 @app.get("/admin/debug")
 def admin_debug():
     token = request.args.get("token","")
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         return jsonify(ok=False, error="forbidden"), 403
-    # QNA: conta linhas do CSV
     qna_count = 0
     try:
         with open("base_qna.csv", newline='', encoding='utf-8') as f:
             for _ in csv.DictReader(f): qna_count += 1
     except Exception:
         qna_count = 0
-    # Produtos
     global PROD_CACHE
     if PROD_CACHE is None: PROD_CACHE = _carregar_produtos()
     prod_count = len(PROD_CACHE or [])
