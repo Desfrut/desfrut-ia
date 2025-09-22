@@ -3,6 +3,12 @@ from flask import Flask, request, jsonify, render_template_string
 import os, json, re, csv, difflib, random
 from datetime import datetime
 
+import traceback
+import logging
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("desfrut-ia")
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEN_MODEL      = os.getenv("GEN_MODEL", "gpt-4o-mini")
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-3-small")
@@ -227,22 +233,23 @@ STOPWORDS_SHORT = {"ola","olá","oi","sim","ok","blz","tá","ta","beleza","boa",
 
 def looks_like_bairro(txt: str) -> bool:
     t = (txt or "").strip().lower()
-    if not (1 <= len(t) <= 30): 
+    if not (1 <= len(t) <= 30):
         return False
-    # sem pontuação e sem números
-    if re.search(r"[^a-zà-ú\s]", t): 
+    # só letras/acentos/espaços (sem números e pontuação)
+    if re.search(r"[^a-zà-ú\s]", t):
         return False
-    # 1 a 3 palavras
-    if len(t.split()) > 3: 
+    # no máx. 3 palavras
+    if len(t.split()) > 3:
         return False
-    # não pode ser stopword
-    if t in STOPWORDS_SHORT: 
+    # filtros negativos
+    if t in STOPWORDS_SHORT:
         return False
-    # não conter verbos/perguntas típicas
     if re.search(r"\b(quero|saber|saiu|tem|faz|fazer|pode|quando|onde|prazo|status)\b", t):
         return False
-    # não colisão com intenções fortes
-    if any(p.search(txt) for p in [ENTREGA_RE, TAXA_RE, HUMANO_RE, FINALIZE_RE, PAYMENT_RE, RETIRADA_RE, STATUS_RE, GREETING_RE, RESET_RE]):
+    if any(p.search(txt) for p in [
+        ENTREGA_RE, TAXA_RE, HUMANO_RE, FINALIZE_RE, PAYMENT_RE,
+        RETIRADA_RE, TEMPO_RE
+    ]):
         return False
     return True
 
@@ -668,14 +675,50 @@ def _respond(question, cust_id=None, cust_name=None):
 
 @app.post("/ask")
 def ask():
+    data = request.get_json(silent=True) or {}
+    q = (data.get("question") or "").strip()
+    cust_id = data.get("customer_id")
+    cust_name = data.get("customer_name")
+
+    if not q:
+        return jsonify(error="Pergunta vazia."), 400
+
     try:
-        data = request.get_json(silent=True) or {}
-        q = (data.get("question") or "").strip()
-        if not q: return jsonify(error="Pergunta vazia."), 400
-        ans, src = _respond(q, data.get("customer_id"), data.get("customer_name"))
-        return jsonify(answer=ans, source=src), 200
-    except Exception:
-        return jsonify(answer=humanize("Tive uma instabilidade, mas já voltei. Pode repetir por favor?"), source="error"), 200
+        # 1) Q&A lexical
+        a = answer_qna_lexical(q)
+        if a:
+            return jsonify(answer=humanize(a, cust_name), source="qna_lexical"), 200
+
+        # 2) Q&A embeddings
+        a = answer_qna(q)
+        if a:
+            return jsonify(answer=humanize(a, cust_name), source="qna_embed"), 200
+
+        # 3) Agente (frete/bairro/checkout/produtos)
+        try:
+            a = agente_responder(q, cust_id, cust_name)
+        except Exception as e:
+            log.error("agent_error: %s\n%s", e, traceback.format_exc())
+            a = None
+        if a:
+            return jsonify(answer=a, source="agent"), 200
+
+        # 4) RAG (opcional)
+        a = answer_rag(q)
+        if a:
+            return jsonify(answer=humanize(a, cust_name), source="rag"), 200
+
+        # 5) Fallback
+        return jsonify(answer=humanize(random.choice(MICROCOPY["fallback"]), cust_name), source="fallback"), 200
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        log.error("ask_error: %s\n%s", e, tb)
+        # Mantém a mesma mensagem amigável que você viu, mas com a 'source' útil pra log
+        return jsonify(
+            answer=humanize("Tive uma instabilidade, mas já voltei. Pode repetir por favor?", cust_name),
+            source=f"error:{str(e)[:80]}"
+        ), 200
 
 def _train_qna(csv_path: str, reset=False) -> int:
     try:
