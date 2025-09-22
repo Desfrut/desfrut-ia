@@ -566,6 +566,63 @@ def admin_qna_count():
         return jsonify(ok=True, count=c)
     except Exception as e:
         return jsonify(ok=False, error=str(e))
+# ===== DIAGNÓSTICOS RÁPIDOS =====
+@app.get("/admin/prod_count")
+def admin_prod_count():
+    token = request.args.get("token","")
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        return jsonify(ok=False, error="forbidden"), 403
+    global PROD_CACHE
+    if PROD_CACHE is None:
+        PROD_CACHE = _carregar_produtos()
+    sample = []
+    for p in (PROD_CACHE or [])[:5]:
+        sample.append(p.get("nome") or p.get("título") or p.get("titulo") or "")
+    return jsonify(ok=True, count=len(PROD_CACHE or []), sample=sample, file=PRODUTOS_CSV)
 
+@app.get("/admin/debug")
+def admin_debug():
+    token = request.args.get("token","")
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        return jsonify(ok=False, error="forbidden"), 403
+    # QNA count
+    qna_count = None
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
+        col = client.get_or_create_collection("qna")
+        try:
+            qna_count = col.count()
+        except Exception:
+            res = col.get(ids=None, include=[])
+            qna_count = len(res.get("ids", []))
+    except Exception:
+        qna_count = -1  # erro
+
+    # Produtos
+    prod = []
+    global PROD_CACHE
+    if PROD_CACHE is None:
+        PROD_CACHE = _carregar_produtos()
+    prod_count = len(PROD_CACHE or [])
+    for p in (PROD_CACHE or [])[:3]:
+        prod.append(p.get("nome") or p.get("título") or p.get("titulo") or "")
+
+    return jsonify(
+        ok=True,
+        version=AGENT_VERSION,
+        oai_ok=bool(OPENAI_API_KEY) and (oai is not None),
+        env={
+            "TZ": os.getenv("TZ",""),
+            "STATE_DB": STATE_DB,
+            "CHROMA_DIR": CHROMA_DIR,
+            "PRODUTOS_CSV": PRODUTOS_CSV
+        },
+        qna_count=qna_count,
+        prod_count=prod_count,
+        prod_sample=prod,
+        prod_file_exists=os.path.exists(PRODUTOS_CSV)
+    )
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","10000")), debug=False)
